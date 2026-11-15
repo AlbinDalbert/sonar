@@ -1,0 +1,40 @@
+# Rendered into conf.d/ by the nginx image at startup. Only set environment variables
+# (TTS_API_URL) are substituted; nginx's own $variables pass through untouched.
+
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+
+    # `expires` rather than add_header for caching, so these stay inherited by every location.
+    add_header Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    location /tts-api/ {
+        proxy_pass ${TTS_API_URL}/;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        # Generation progress is SSE, and a long text can run for many minutes.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+        client_max_body_size 100m;
+    }
+
+    # Hashed file names: cache forever.
+    location /assets/ {
+        expires max;
+    }
+
+    location / {
+        try_files $uri /index.html;
+        expires -1;
+    }
+}

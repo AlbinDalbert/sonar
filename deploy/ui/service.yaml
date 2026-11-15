@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sonar-ui
+  labels:
+    app: sonar-ui
+spec:
+  selector:
+    app: sonar-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

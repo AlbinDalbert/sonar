@@ -1,0 +1,12 @@
+# The web UI: nginx serving the static build and proxying /tts-api to sonar-api. See ../README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+
+images:
+  - name: sonar-ui
+    newName: ghcr.io/albindalbert/sonar-ui
+    newTag: main

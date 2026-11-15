@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonar-ui
+  labels:
+    app: sonar-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sonar-ui
+  template:
+    metadata:
+      labels:
+        app: sonar-ui
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: ui
+          image: sonar-ui
+          imagePullPolicy: Always
+          env:
+            # The API's address from inside the cluster. Must resolve when nginx starts.
+            - name: TTS_API_URL
+              value: http://sonar-api:8888
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 128Mi }

@@ -1,0 +1,166 @@
+/* Xebec's Ember palette and type. */
+:root {
+  --bg: #0c0b09;
+  --panel: #15130f;
+  --text: #e6dfd4;
+  --text-strong: #fbf7ef;
+  --text-dim: #8f8678;
+  --border: #302b23;
+  --accent: #dfa13d;
+  --accent-strong: #f2c96f;
+  --accent-soft: rgba(223, 161, 61, 0.12);
+  --danger: #e0786f;
+
+  --font-ui: 'JetBrains Mono Variable', 'Liberation Mono', ui-monospace, monospace;
+  --font-prose: 'Iowan Old Style', Charter, 'Bitstream Charter', 'Liberation Serif', Georgia, serif;
+
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+::selection { background: var(--accent-soft); color: var(--text-strong); }
+:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
+
+* { scrollbar-color: var(--border) transparent; scrollbar-width: thin; }
+
+.dim { color: var(--text-dim); }
+.error { color: var(--danger); }
+.hint { font-size: 12px; }
+
+.page { max-width: 1120px; margin: 0 auto; padding: 24px clamp(16px, 4vw, 32px) 56px; }
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px 24px;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+h1 { font-size: 14px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent-strong); }
+.header-side { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; }
+.status-line { font-size: 12px; }
+.user { display: flex; align-items: center; gap: 8px; color: var(--text-dim); }
+.user input { width: 140px; }
+
+main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); align-items: start; gap: 20px; }
+@media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+.stack { display: grid; gap: 20px; min-width: 0; }
+
+/* ---------- Panels ---------- */
+
+.win { background: var(--panel); border: 1px solid var(--border); min-width: 0; }
+.win .bar {
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.win .body { padding: 16px; }
+
+/* ---------- Forms ---------- */
+
+.form { display: grid; gap: 14px; }
+.form label, .keep label { display: grid; gap: 4px; color: var(--text-dim); font-size: 12px; }
+.row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.label-row { display: flex; justify-content: space-between; }
+.form .check { display: flex; align-items: center; gap: 8px; }
+
+input:not([type='checkbox']), textarea, select {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 var(--font-ui);
+}
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+input:disabled, select:disabled { color: var(--text-dim); }
+textarea { display: block; resize: vertical; }
+textarea.prose { font: 17px/1.55 var(--font-prose); padding: 10px 12px; }
+::placeholder { color: var(--text-dim); opacity: 1; }
+input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--accent); }
+
+/* Bracket buttons */
+button, .button {
+  display: inline-block;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+button::before, .button::before { content: '[ '; color: var(--text-dim); }
+button::after, .button::after { content: ' ]'; color: var(--text-dim); }
+button:hover:not(:disabled), .button:hover { border-color: var(--accent); color: var(--accent-strong); }
+button.primary { border-color: var(--accent); color: var(--accent-strong); padding: 5px 16px; }
+button:disabled { opacity: 0.45; cursor: default; }
+button.armed { border-color: var(--danger); color: var(--danger); }
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.meter { height: 3px; margin-bottom: 6px; background: var(--border); }
+.meter div { height: 100%; background: var(--accent); transition: width 0.2s; }
+
+/* ---------- Clips ---------- */
+
+.clips { list-style: none; padding: 0; display: grid; gap: 16px; }
+.clip { display: grid; gap: 8px; min-width: 0; }
+.clip + .clip { padding-top: 16px; border-top: 1px solid var(--border); }
+.clip-head { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+.clip-head strong { color: var(--accent-strong); font-weight: 500; }
+.clip-text { font-family: var(--font-prose); font-size: 15px; }
+.clip audio { width: 100%; height: 40px; }
+.keep { display: grid; gap: 8px; padding-top: 4px; }
+
+/* ---------- Voices ---------- */
+
+.group-head { display: flex; justify-content: space-between; align-items: center; margin: 18px 0 6px; }
+.group-head:first-of-type { margin-top: 0; }
+.group-head h3 { font-size: 11px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-dim); }
+
+.preset-form { padding: 12px; margin-bottom: 10px; border: 1px solid var(--border); }
+
+.voices { list-style: none; padding: 0; max-height: 360px; overflow-y: auto; }
+.voices li { display: flex; align-items: center; gap: 6px; padding-right: 6px; border-left: 2px solid transparent; }
+.voices li.selected { border-left-color: var(--accent); background: var(--accent-soft); }
+
+button.pick {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  padding: 6px 8px;
+  border: 0;
+  font-size: 13px;
+  text-align: left;
+  white-space: normal;
+}
+button.pick::before, button.pick::after { content: none; }
+button.pick:hover:not(:disabled) { color: var(--accent-strong); }
+.desc { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Bigger targets on touch, and 16px stops iPhones zooming into focused fields. */
+@media (pointer: coarse) {
+  input:not([type='checkbox']), select, textarea { font-size: 16px; }
+  button, .button { padding: 7px 12px; }
+}

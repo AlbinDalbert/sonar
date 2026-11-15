@@ -1,0 +1,10 @@
+# Uploaded and designed voices, and each user's presets.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sonar-reference-audio
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi

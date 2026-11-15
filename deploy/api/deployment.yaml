@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonar-api
+  labels:
+    app: sonar-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sonar-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: sonar-api
+    spec:
+      # NVIDIA container runtime (k3s + nvidia-container-toolkit). Patch out if your cluster
+      # injects GPUs another way.
+      runtimeClassName: nvidia
+      containers:
+        - name: api
+          image: sonar-api
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8888
+              name: http
+          envFrom:
+            # Optional settings (see api/README.md, "Environment variables"); the image's
+            # defaults work without it.
+            - configMapRef:
+                name: sonar-api-config
+                optional: true
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: reference-audio
+              mountPath: /reference-audio
+          resources:
+            requests:
+              cpu: "1"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8888
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8888
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+      volumes:
+        # Hugging Face cache. The image runs offline, so the models must already be here.
+        - name: model-cache
+          hostPath:
+            path: /var/lib/sonar-models
+            type: DirectoryOrCreate
+        - name: reference-audio
+          persistentVolumeClaim:
+            claimName: sonar-reference-audio

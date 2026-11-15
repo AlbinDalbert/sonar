@@ -1,0 +1,13 @@
+# The API: a GPU Deployment, its Service and the volume for voices. See ../README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - pvc.yaml
+
+images:
+  - name: sonar-api
+    newName: ghcr.io/albindalbert/sonar-api
+    newTag: main
