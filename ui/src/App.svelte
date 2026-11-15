@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { getInfo, getStatus, listVoices, type Status, type Voices } from './lib/api'
+  import Mark from './lib/Mark.svelte'
   import Speak from './lib/Speak.svelte'
   import VoiceManager from './lib/VoiceManager.svelte'
 
@@ -84,7 +85,7 @@
 
 <div class="page">
   <header>
-    <h1>Sonar</h1>
+    <h1><Mark size={18} />Sonar</h1>
     <div class="header-side">
       <p class="dim status-line" class:error={offline} role="status">{statusText}</p>
       <label class="user">
