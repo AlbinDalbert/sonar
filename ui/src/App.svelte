@@ -6,6 +6,8 @@
   import VoiceManager from './lib/VoiceManager.svelte'
 
   const FALLBACK_LANGUAGES = ['Auto', 'English']
+  // Picked when the voices load, if this user has it. Otherwise the first voice.
+  const DEFAULT_VOICE = /^clone:caleb\.\w+$/i
 
   const initialUser = new URLSearchParams(location.search).get('user')?.trim() || 'default'
   let user = $state(initialUser)
@@ -31,7 +33,9 @@
         ...loaded.presets.map((preset) => `preset:${preset.name}`),
         'design',
       ]
-      if (!options.includes(voice)) voice = options[0]
+      if (!options.includes(voice)) {
+        voice = options.find((option) => DEFAULT_VOICE.test(option)) ?? options[0]
+      }
     } catch (e) {
       loadError = (e as Error).message
     }

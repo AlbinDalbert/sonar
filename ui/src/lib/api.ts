@@ -1,4 +1,4 @@
-import { SseParser } from './sse'
+import { Pcm16Decoder, wavFromPcm } from './pcm'
 
 const BASE = '/tts-api'
 
@@ -36,16 +36,10 @@ export interface TtsRequest {
   mode: 'clone' | 'design'
   model_size: string
   cpu_mode: boolean
-  audio_format: 'wav'
+  audio_format: 'pcm'
   reference_audio?: string
   voice_preset?: string
   voice_description?: string
-}
-
-export interface Progress {
-  percent: number
-  chunk: number
-  of: number
 }
 
 async function errorMessage(response: Response): Promise<string> {
@@ -126,31 +120,37 @@ export function deletePreset(user: string, name: string) {
   return call(`/voice-presets/${encodeURIComponent(name)}${forUser(user)}`, { method: 'DELETE' })
 }
 
-// Generates through the progress stream and resolves with the finished WAV.
-export async function synthesize(
+export interface Speech {
+  audio: Blob
+  // True when the request was aborted and `audio` holds only what arrived before that.
+  stopped: boolean
+}
+
+// Streams generated audio, handing each piece to onAudio as it arrives, and resolves with the
+// whole clip as a WAV. Aborting closes the connection, which stops generation on the server.
+export async function streamSpeech(
   request: TtsRequest,
-  onProgress: (progress: Progress) => void,
+  onAudio: (samples: Float32Array, sampleRate: number) => void,
   signal: AbortSignal,
-): Promise<Blob> {
-  const response = await fetch(`${BASE}/api/tts/stream`, { ...jsonBody(request), signal })
+): Promise<Speech> {
+  const response = await fetch(`${BASE}/api/tts/audio-stream`, { ...jsonBody(request), signal })
   if (!response.ok) throw new Error(await errorMessage(response))
 
-  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader()
-  const parser = new SseParser()
+  const sampleRate = Number(response.headers.get('X-Sample-Rate')) || 24000
+  const decoder = new Pcm16Decoder()
+  const chunks: Uint8Array[] = []
+  const reader = response.body!.getReader()
   for (;;) {
-    const { done, value } = await reader.read()
-    if (done) throw new Error('The connection closed before the audio was finished')
-
-    for (const { event, data } of parser.feed(value)) {
-      const payload = JSON.parse(data)
-      if (event === 'error') throw new Error(payload.detail ?? 'Generation failed')
-      if (event === 'progress') {
-        onProgress({ percent: payload.overall_pct, chunk: payload.chunk, of: payload.of })
-      }
-      if (event === 'done') {
-        const bytes = Uint8Array.from(atob(payload.audio_b64), (char) => char.charCodeAt(0))
-        return new Blob([bytes], { type: 'audio/wav' })
-      }
+    let result: ReadableStreamReadResult<Uint8Array>
+    try {
+      result = await reader.read()
+    } catch (e) {
+      if (!signal.aborted) throw new Error('The connection broke before the audio was finished')
+      if (!chunks.length) throw e
+      return { audio: wavFromPcm(chunks, sampleRate), stopped: true }
     }
+    if (result.done) return { audio: wavFromPcm(chunks, sampleRate), stopped: false }
+    chunks.push(result.value)
+    onAudio(decoder.feed(result.value), sampleRate)
   }
 }

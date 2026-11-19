@@ -24,7 +24,7 @@ Unprivileged nginx (uid 101) on port **8080**. One setting:
 |---------------|-------------------------|-|
 | `TTS_API_URL` | `http://sonar-api:8888` | The API's address from the container. No trailing slash. It must resolve when nginx starts. |
 
-`/healthz` answers 200 for probes. Generation progress (SSE) is passed through unbuffered.
+`/healthz` answers 200 for probes. Generated audio streams through unbuffered.
 
 ```sh
 docker run -p 8080:8080 -e TTS_API_URL=http://host.docker.internal:8888 ghcr.io/albindalbert/sonar-ui:main

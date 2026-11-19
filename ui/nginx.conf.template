@@ -21,7 +21,7 @@ server {
         proxy_pass ${TTS_API_URL}/;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
-        # Generation progress is SSE, and a long text can run for many minutes.
+        # Generated audio is streamed as it is made, and a long text can run for many minutes.
         proxy_buffering off;
         proxy_cache off;
         proxy_read_timeout 1h;

@@ -119,8 +119,6 @@ button.armed { border-color: var(--danger); color: var(--danger); }
 
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
-.meter { height: 3px; margin-bottom: 6px; background: var(--border); }
-.meter div { height: 100%; background: var(--accent); transition: width 0.2s; }
 
 /* ---------- Clips ---------- */
 

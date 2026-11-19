@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onDestroy } from 'svelte'
-  import { fileLabel, synthesize, type Progress, type TtsRequest, type Voices } from './api'
+  import { fileLabel, streamSpeech, type TtsRequest, type Voices } from './api'
   import ClipRow, { type Clip } from './ClipRow.svelte'
+  import { StreamPlayer } from './player'
   import Window from './Window.svelte'
 
   interface Props {
@@ -21,12 +22,15 @@
   let cpuMode = $state(false)
 
   let busy = $state(false)
-  let progress = $state<Progress | null>(null)
+  // Live playback can outlast the request: the end of the audio arrives faster than it plays.
+  let playing = $state(false)
+  let seconds = $state(0)
   let error = $state('')
   let notice = $state('')
   let clips = $state.raw<Clip[]>([])
 
   let controller: AbortController | null = null
+  let player: StreamPlayer | null = null
   let nextId = 1
 
   const designing = $derived(voice === 'design' || voice.startsWith('preset:'))
@@ -34,7 +38,7 @@
   const voiceName = (value: string) => value.slice(value.indexOf(':') + 1).replace(/\.\w+$/, '')
 
   function buildRequest(): TtsRequest {
-    const base = { text: text.trim(), user, language, cpu_mode: cpuMode, audio_format: 'wav' as const }
+    const base = { text: text.trim(), user, language, cpu_mode: cpuMode, audio_format: 'pcm' as const }
     if (voice === 'design') {
       return { ...base, mode: 'design', model_size: 'quality', voice_description: description.trim() }
     }
@@ -50,24 +54,52 @@
     const design = voice === 'design' ? description.trim() : undefined
     const label = voice === 'design' ? 'New voice' : voiceName(voice)
 
+    stopPlayback()
+    // Made here, still inside the click or key press, so the browser lets it play.
+    const live = new StreamPlayer()
+    player = live
+    playing = true
     controller = new AbortController()
     busy = true
     error = notice = ''
-    progress = null
+    seconds = 0
+    let complete = false
     try {
-      const audio = await synthesize(request, (update) => (progress = update), controller.signal)
+      const { audio, stopped } = await streamSpeech(
+        request,
+        (samples, sampleRate) => {
+          live.play(samples, sampleRate)
+          seconds += samples.length / sampleRate
+        },
+        controller.signal,
+      )
       const clip = { id: nextId++, url: URL.createObjectURL(audio), audio, text: request.text, voice: label, design }
       clips = [clip, ...clips]
+      if (stopped) notice = 'Stopped. The clip has what was generated up to then.'
+      complete = !stopped
     } catch (e) {
-      if ((e as Error).name === 'AbortError') {
-        notice = 'Stopped waiting. The server still finishes this one, so the GPU stays busy until then.'
-      } else {
-        error = (e as Error).message
-      }
+      if ((e as Error).name === 'AbortError') notice = 'Stopped before any audio arrived.'
+      else error = (e as Error).message
     } finally {
       busy = false
       controller = null
     }
+    if (!complete) return stopPlayback(live)
+    await live.finished()
+    stopPlayback(live)
+  }
+
+  // Stops the given player, or whichever is playing, unless a newer one has taken over.
+  function stopPlayback(which: StreamPlayer | null = player) {
+    if (!which || which !== player) return
+    which.stop()
+    player = null
+    playing = false
+  }
+
+  function stop() {
+    controller?.abort()
+    stopPlayback()
   }
 
   function remove(clip: Clip) {
@@ -80,7 +112,7 @@
   }
 
   onDestroy(() => {
-    controller?.abort()
+    stop()
     clips.forEach((clip) => URL.revokeObjectURL(clip.url))
   })
 </script>
@@ -159,24 +191,23 @@
       </label>
 
       <div class="actions">
-        {#if busy}
-          <button type="button" onclick={() => controller?.abort()}>Stop waiting</button>
+        {#if busy || playing}
+          <button type="button" onclick={stop}>Stop</button>
         {:else}
           <button class="primary" type="submit" disabled={!ready}>Generate</button>
         {/if}
       </div>
 
-      {#if busy}
-        <div role="status">
-          <div class="meter"><div style:width={`${progress?.percent ?? 0}%`}></div></div>
-          <p class="dim hint">
-            {#if progress}
-              Part {progress.chunk} of {progress.of}, {progress.percent}%
-            {:else}
-              Loading the model. This takes a few seconds.
-            {/if}
-          </p>
-        </div>
+      {#if busy || playing}
+        <p class="dim hint" role="status">
+          {#if busy && !seconds}
+            Loading the model. This takes a few seconds.
+          {:else if busy}
+            Playing as it generates, {seconds.toFixed(1)} s so far
+          {:else}
+            Generated {seconds.toFixed(1)} s, finishing playback
+          {/if}
+        </p>
       {/if}
       {#if notice}<p class="dim hint" role="status">{notice}</p>{/if}
       {#if error}<p class="error" role="alert">{error}</p>{/if}
