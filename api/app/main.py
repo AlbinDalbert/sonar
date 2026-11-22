@@ -2,6 +2,7 @@ import base64
 from collections import OrderedDict
 import contextlib
 import io
+import itertools
 import json
 import os
 import re
@@ -90,6 +91,29 @@ MODEL_IDS = {
 ASR_MODEL_IDS = {
     "fast": os.getenv("QWEN_ASR_MODEL_ID_06", "Qwen/Qwen3-ASR-0.6B"),
     "quality": os.getenv("QWEN_ASR_MODEL_ID_17", "Qwen/Qwen3-ASR-1.7B"),
+}
+OPENAI_AUDIO_CONTENT_TYPES = {
+    "mp3": "audio/mpeg",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+    "wav": "audio/wav",
+    "pcm": "audio/pcm",
+}
+OPENAI_VOICE_DESCRIPTIONS = {
+    "alloy": "Balanced, neutral, clear mid-pitch voice with steady pacing",
+    "ash": "Clear, grounded, slightly husky mid-low voice",
+    "ballad": "Warm, expressive, melodic storytelling voice",
+    "coral": "Warm, friendly, articulate female voice",
+    "echo": "Smooth, calm, resonant male voice",
+    "fable": "Expressive, articulate British-accented narrator voice",
+    "onyx": "Deep, authoritative, steady male voice",
+    "nova": "Bright, clear, energetic female voice",
+    "sage": "Calm, thoughtful, composed voice with measured pacing",
+    "shimmer": "Soft, clear, gentle female voice",
+    "verse": "Dynamic, engaging, natural conversational voice",
+    "marin": "Clear, natural, relaxed modern female voice",
+    "cedar": "Warm, natural, grounded male voice",
 }
 model_status = {"state": "idle", "kind": None, "model_id": None, "device": None}  # idle | loading | ready
 QWEN_MEMORY_PATCH_ENABLED = False
@@ -196,6 +220,19 @@ class TTSRequest(BaseModel):
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
     voice_preset: Optional[str] = Field(default=None, description="Named voice preset to resolve into voice_description")
     user: Optional[str] = Field(default="default", description="User namespace for reference audio")
+    cpu_mode: bool = Field(default=False, description="Run this request on CPU; no automatic fallback")
+
+
+class OpenAISpeechRequest(BaseModel):
+    model: str = Field(default="tts-1", description="OpenAI model name (tts-1, tts-1-hd, gpt-4o-mini-tts) or Sonar size/model ID")
+    input: str = Field(..., min_length=1, description="Text to synthesize")
+    voice: str = Field(default="alloy", description="Voice preset name, reference audio filename, OpenAI voice name, or voice description")
+    response_format: str = Field(default="mp3", description="mp3 | opus | aac | flac | wav | pcm")
+    speed: float = Field(default=1.0, ge=0.25, le=4.0, description="Playback speed (0.25 to 4.0)")
+    instructions: Optional[str] = Field(default=None, description="Optional delivery instructions for design mode")
+    stream_format: str = Field(default="audio", description="audio | sse")
+    language: str = Field(default="Auto", description="Language or Auto")
+    user: Optional[str] = Field(default="default", description="User namespace for reference audio and presets")
     cpu_mode: bool = Field(default=False, description="Run this request on CPU; no automatic fallback")
 
 
@@ -1732,23 +1769,326 @@ def delete_voice_preset(name: str, user: str = Query(default="default")):
     return {"ok": True, "deleted": preset_name}
 
 
-@app.post("/api/tts/audio-stream")
-def tts_audio_stream(req: TTSRequest):
-    """Stream audio while it is being generated.
+def _build_atempo_filter(speed: float) -> Optional[str]:
+    if abs(speed - 1.0) <= 1e-6:
+        return None
+    factors: list[float] = []
+    remaining = float(speed)
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join(f"atempo={f:.6f}" for f in factors)
 
-    Codec frames are captured from the talker as they are sampled and decoded
-    in small spans, so playback can start after a few hundred ms of audio
-    instead of after a whole text chunk. Long text is still split with
-    chunk_text(); each chunk is generated in turn on the same stream.
 
-    `audio_format`: `pcm` = raw s16le mono, `wav` = the same with a streaming
-    WAV header. The sample rate is in the X-Sample-Rate header either way.
-    """
-    req = apply_voice_preset(req)
-    user_dir = user_audio_dir(req.user or "default")
-    audio_format = req.audio_format.lower().strip()
-    if audio_format not in {"wav", "pcm"}:
-        raise HTTPException(status_code=400, detail="audio_format must be wav or pcm for audio-stream endpoint")
+def _ffmpeg_encode_pcm_stream(
+    pcm_chunks,
+    sample_rate: int,
+    target_format: str,
+    speed: float,
+    cancel: threading.Event,
+):
+    """Stream raw s16le mono PCM through ffmpeg into the requested format."""
+    atempo = _build_atempo_filter(speed)
+    if target_format == "mp3":
+        out_args = ["-f", "mp3", "-c:a", "libmp3lame", "-b:a", "128k", "-write_xing", "0", "-id3v2_version", "0"]
+    elif target_format == "opus":
+        out_args = ["-f", "ogg", "-c:a", "libopus", "-b:a", "64k", "-page_duration", "40000"]
+    elif target_format == "aac":
+        out_args = ["-f", "adts", "-c:a", "aac", "-b:a", "128k"]
+    elif target_format == "flac":
+        out_args = ["-f", "flac", "-c:a", "flac"]
+    elif target_format in {"pcm", "wav"}:
+        out_args = ["-f", "s16le", "-c:a", "pcm_s16le"]
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported audio format: {target_format}")
+
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "s16le",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-i", "pipe:0",
+    ]
+    if atempo:
+        cmd.extend(["-af", atempo])
+    cmd.extend(["-flush_packets", "1", *out_args, "pipe:1"])
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail=f"ffmpeg is required to stream {target_format} audio",
+        )
+
+    feed_error: list[Optional[BaseException]] = [None]
+    stderr_chunks: list[bytes] = []
+
+    def feed_stdin() -> None:
+        try:
+            for chunk in pcm_chunks:
+                if cancel.is_set():
+                    break
+                if not chunk:
+                    continue
+                try:
+                    proc.stdin.write(chunk)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break
+        except BaseException as exc:
+            feed_error[0] = exc
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    def drain_stderr() -> None:
+        try:
+            data = proc.stderr.read()
+            if data:
+                stderr_chunks.append(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    feeder = threading.Thread(target=feed_stdin, daemon=True)
+    err_reader = threading.Thread(target=drain_stderr, daemon=True)
+    feeder.start()
+    err_reader.start()
+
+    stdout_fd = proc.stdout.fileno()
+    completed = False
+    try:
+        while True:
+            data = os.read(stdout_fd, 4096)
+            if not data:
+                break
+            yield data
+        completed = True
+    finally:
+        if not completed:
+            cancel.set()
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5 if completed else 2)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                proc.wait()
+        feeder.join(timeout=5)
+        err_reader.join(timeout=2)
+
+    if feed_error[0] is not None:
+        raise feed_error[0]
+    if not cancel.is_set() and proc.returncode != 0:
+        err_msg = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+        raise HTTPException(
+            status_code=500,
+            detail=f"ffmpeg failed while encoding {target_format}{f': {err_msg}' if err_msg else ''}",
+        )
+
+
+def _resolve_openai_tts_model_size(model: Optional[str]) -> str:
+    raw = (model or "").strip().lower()
+    if not raw:
+        return "fast"
+    if raw in {"fast", "quality"}:
+        return raw
+    if (
+        raw in {"tts-1-hd", "hd"}
+        or raw == MODEL_IDS["clone"]["quality"].lower()
+        or raw == MODEL_IDS["design"]["quality"].lower()
+        or "1.7b" in raw
+        or "hd" in raw.split("-")
+    ):
+        return "quality"
+    return "fast"
+
+
+def _find_voice_preset_by_voice(voice: str, user: str) -> Optional[dict]:
+    with voice_presets_lock:
+        presets = load_voice_presets(user_presets_path(user))
+    if voice in presets:
+        return presets[voice]
+    lowered = voice.lower()
+    for name, preset in presets.items():
+        if name.lower() == lowered:
+            return preset
+    return None
+
+
+def _find_reference_audio_by_voice(voice: str, user_dir: Path) -> Optional[str]:
+    if not voice or "/" in voice or "\\" in voice or voice.startswith(".") or ".." in voice:
+        return None
+    exact = user_dir / voice
+    if exact.is_file() and not exact.name.endswith(".meta.json"):
+        return exact.name
+    lowered = voice.lower()
+    ci_match: Optional[str] = None
+    for p in sorted(user_dir.iterdir()):
+        if not p.is_file() or p.name.startswith(".") or p.name.endswith(".meta.json"):
+            continue
+        if p.stem == voice:
+            return p.name
+        if ci_match is None and (p.name.lower() == lowered or p.stem.lower() == lowered):
+            ci_match = p.name
+    return ci_match
+
+
+def _combine_voice_description(base: str, instructions: str) -> str:
+    base = base.strip()
+    instructions = instructions.strip()
+    if not instructions:
+        return base
+    if not base:
+        return instructions
+    sep = " " if base[-1] in ".!?" else ". "
+    return f"{base}{sep}{instructions}"
+
+
+def _resolve_openai_voice(
+    voice: Optional[str],
+    instructions: Optional[str],
+    user: str,
+    user_dir: Path,
+    _allow_default: bool = True,
+) -> dict:
+    raw_voice = (voice or "").strip()
+    instr = (instructions or "").strip()
+    lowered = raw_voice.lower()
+
+    if lowered.startswith("preset:"):
+        preset_name = _normalize_preset_name(raw_voice[len("preset:"):])
+        preset = _find_voice_preset_by_voice(preset_name, user)
+        if not preset:
+            raise HTTPException(status_code=404, detail=f"voice preset not found: {preset_name}")
+        return {
+            "mode": "design",
+            "voice_preset": preset["name"],
+            "voice_description": _combine_voice_description(preset["voice_description"], instr),
+            "reference_audio": None,
+        }
+
+    if lowered.startswith("clone:"):
+        ref_name = raw_voice[len("clone:"):].strip()
+        if not ref_name:
+            raise HTTPException(status_code=400, detail="reference audio filename required after clone:")
+        resolved = _find_reference_audio_by_voice(ref_name, user_dir)
+        if not resolved:
+            svc.resolve_reference_audio(ref_name, user_dir)
+            resolved = ref_name
+        return {
+            "mode": "clone",
+            "voice_preset": None,
+            "voice_description": None,
+            "reference_audio": resolved,
+        }
+
+    if lowered.startswith("design:"):
+        desc = _combine_voice_description(raw_voice[len("design:"):], instr)
+        if not desc:
+            raise HTTPException(status_code=400, detail="voice description required after design:")
+        return {
+            "mode": "design",
+            "voice_preset": None,
+            "voice_description": desc,
+            "reference_audio": None,
+        }
+
+    if raw_voice:
+        preset = _find_voice_preset_by_voice(raw_voice, user)
+        if preset:
+            return {
+                "mode": "design",
+                "voice_preset": preset["name"],
+                "voice_description": _combine_voice_description(preset["voice_description"], instr),
+                "reference_audio": None,
+            }
+
+        ref_file = _find_reference_audio_by_voice(raw_voice, user_dir)
+        if ref_file:
+            return {
+                "mode": "clone",
+                "voice_preset": None,
+                "voice_description": None,
+                "reference_audio": ref_file,
+            }
+
+    if not raw_voice or lowered == "default" or lowered in OPENAI_VOICE_DESCRIPTIONS:
+        default_voice = os.getenv("QWEN_OPENAI_DEFAULT_VOICE", "").strip()
+        if _allow_default and default_voice:
+            return _resolve_openai_voice(default_voice, instr, user, user_dir, _allow_default=False)
+        if not raw_voice or lowered == "default":
+            base_desc = instr if instr else OPENAI_VOICE_DESCRIPTIONS["alloy"]
+            return {
+                "mode": "design",
+                "voice_preset": None,
+                "voice_description": base_desc,
+                "reference_audio": None,
+            }
+        return {
+            "mode": "design",
+            "voice_preset": None,
+            "voice_description": _combine_voice_description(OPENAI_VOICE_DESCRIPTIONS[lowered], instr),
+            "reference_audio": None,
+        }
+
+    if " " in raw_voice:
+        return {
+            "mode": "design",
+            "voice_preset": None,
+            "voice_description": _combine_voice_description(raw_voice, instr),
+            "reference_audio": None,
+        }
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"Voice not found: {raw_voice}. Use a voice preset name, reference audio filename, "
+            f"standard OpenAI voice ({', '.join(sorted(OPENAI_VOICE_DESCRIPTIONS))}), or a voice description."
+        ),
+    )
+
+
+def _stream_tts_audio(
+    req: TTSRequest,
+    user_dir: Path,
+    audio_format: str,
+    speed: float = 1.0,
+    stream_format: str = "audio",
+    log_prefix: str = "tts_audio_stream",
+    content_disposition: Optional[str] = None,
+) -> StreamingResponse:
+    """Shared frame-level streaming TTS engine for /api/tts/audio-stream and /v1/audio/speech."""
     if not QWEN_MEMORY_PATCH_ENABLED:
         raise HTTPException(status_code=501, detail="frame streaming unavailable: talker patch not active")
     svc.validate_request(req, user_dir)
@@ -1823,7 +2163,7 @@ def tts_audio_stream(req: TTSRequest):
                     yield shaper.feed(decoder.decode_pending())
                     yield shaper.finish()
                     print(json.dumps({
-                        "event": "tts_audio_stream_chunk",
+                        "event": f"{log_prefix}_chunk",
                         "chunk": value + 1,
                         "of": n_chunks,
                         "chars": len(chunks[value]),
@@ -1856,13 +2196,13 @@ def tts_audio_stream(req: TTSRequest):
     # Wait for the first audio before sending headers, so a failure (GPU
     # busy, bad voice, ...) is a proper error status, not an empty 200.
     try:
-        first = next(payloads, b"")
+        first_pcm = next(payloads, b"")
     except Exception as e:
         cancel.set()
         gen_thread.join()
         payloads.close()
         print(json.dumps({
-            "event": "tts_audio_stream_first_audio_error",
+            "event": f"{log_prefix}_first_audio_error",
             "detail": str(getattr(e, "detail", e)),
             "chunks": n_chunks,
             "cuda": cuda_memory_snapshot(),
@@ -1872,17 +2212,78 @@ def tts_audio_stream(req: TTSRequest):
             raise
         raise HTTPException(status_code=500, detail=f"tts audio stream failed before first audio: {e}")
 
+    needs_ffmpeg = audio_format not in {"pcm", "wav"} or abs(speed - 1.0) > 1e-6
+    encoded_stream = None
+    first_out = first_pcm
+
+    if needs_ffmpeg and first_pcm:
+        encoded_stream = _ffmpeg_encode_pcm_stream(
+            itertools.chain([first_pcm], payloads),
+            sample_rate=sample_rate,
+            target_format=audio_format,
+            speed=speed,
+            cancel=cancel,
+        )
+        try:
+            first_out = next(encoded_stream, b"")
+        except Exception as e:
+            cancel.set()
+            encoded_stream.close()
+            gen_thread.join()
+            payloads.close()
+            print(json.dumps({
+                "event": f"{log_prefix}_first_audio_error",
+                "detail": str(getattr(e, "detail", e)),
+                "chunks": n_chunks,
+                "cuda": cuda_memory_snapshot(),
+            }), flush=True)
+            session.finish(unload_now=True)
+            if isinstance(e, HTTPException):
+                raise
+            raise HTTPException(status_code=500, detail=f"tts audio stream failed before first audio: {e}")
+
     stream_error = [False]
+
+    def audio_bytes_body():
+        if audio_format == "wav":
+            yield wav_stream_header(sample_rate)
+        if first_out:
+            yield first_out
+        if encoded_stream is not None:
+            yield from encoded_stream
+        elif first_pcm:
+            yield from payloads
 
     def body():
         try:
-            if audio_format == "wav":
-                yield wav_stream_header(sample_rate)
-            yield first
-            yield from payloads
+            if stream_format == "sse":
+                for chunk_bytes in audio_bytes_body():
+                    if not chunk_bytes:
+                        continue
+                    delta = {
+                        "type": "speech.audio.delta",
+                        "audio": base64.b64encode(chunk_bytes).decode("ascii"),
+                    }
+                    yield f"event: speech.audio.delta\ndata: {json.dumps(delta)}\n\n".encode("utf-8")
+                input_tokens = max(1, len((req.text or "").split()))
+                output_tokens = int(stats["frames"])
+                done = {
+                    "type": "speech.audio.done",
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                    },
+                }
+                yield f"event: speech.audio.done\ndata: {json.dumps(done)}\n\n".encode("utf-8")
+            else:
+                yield from audio_bytes_body()
             print(json.dumps({
-                "event": "tts_audio_stream_done",
+                "event": f"{log_prefix}_done",
                 "mode": req.mode,
+                "format": audio_format,
+                "stream_format": stream_format,
+                "speed": speed,
                 "chars": len(req.text or ""),
                 "chunks": n_chunks,
                 "frames": stats["frames"],
@@ -1894,7 +2295,7 @@ def tts_audio_stream(req: TTSRequest):
         except Exception as e:
             stream_error[0] = True
             print(json.dumps({
-                "event": "tts_audio_stream_error",
+                "event": f"{log_prefix}_error",
                 "detail": str(getattr(e, "detail", e)),
                 "chunks": n_chunks,
                 "cuda": cuda_memory_snapshot(),
@@ -1902,25 +2303,107 @@ def tts_audio_stream(req: TTSRequest):
             raise
 
     def close_stream() -> None:
-        # Stop generation at the next frame, wait for the worker to exit
-        # generate(), drop decoder tensors, then flush CUDA cache and hand off
-        # to the idle-unload timer (or unload immediately after an error).
+        # Stop generation at the next frame, stop ffmpeg if active, wait for
+        # the worker to exit generate(), drop decoder tensors, then flush CUDA
+        # cache and hand off to the idle-unload timer (or unload on error).
         cancel.set()
+        if encoded_stream is not None:
+            encoded_stream.close()
         gen_thread.join()
         payloads.close()
         session.finish(unload_now=stream_error[0])
 
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "X-Sample-Rate": str(sample_rate),
+        "X-Channels": "1",
+    }
+    if audio_format in {"pcm", "wav"}:
+        headers["X-Sample-Format"] = "s16le"
+    if content_disposition:
+        headers["Content-Disposition"] = content_disposition
+
+    media_type = "text/event-stream" if stream_format == "sse" else OPENAI_AUDIO_CONTENT_TYPES[audio_format]
     return StreamingResponse(
         _ManagedStream(body(), close_stream),
-        media_type="audio/wav" if audio_format == "wav" else "audio/pcm",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "X-Sample-Rate": str(sample_rate),
-            "X-Channels": "1",
-            "X-Sample-Format": "s16le",
-            **({"Content-Disposition": 'inline; filename="tts-stream.wav"'} if audio_format == "wav" else {}),
-        },
+        media_type=media_type,
+        headers=headers,
+    )
+
+
+@app.post("/api/tts/audio-stream")
+def tts_audio_stream(req: TTSRequest):
+    """Stream audio while it is being generated.
+
+    Codec frames are captured from the talker as they are sampled and decoded
+    in small spans, so playback can start after a few hundred ms of audio
+    instead of after a whole text chunk. Long text is still split with
+    chunk_text(); each chunk is generated in turn on the same stream.
+
+    `audio_format`: `pcm` = raw s16le mono, `wav` = the same with a streaming
+    WAV header. The sample rate is in the X-Sample-Rate header either way.
+    """
+    req = apply_voice_preset(req)
+    user_dir = user_audio_dir(req.user or "default")
+    audio_format = req.audio_format.lower().strip()
+    if audio_format not in {"wav", "pcm"}:
+        raise HTTPException(status_code=400, detail="audio_format must be wav or pcm for audio-stream endpoint")
+    return _stream_tts_audio(
+        req=req,
+        user_dir=user_dir,
+        audio_format=audio_format,
+        speed=1.0,
+        stream_format="audio",
+        log_prefix="tts_audio_stream",
+        content_disposition='inline; filename="tts-stream.wav"' if audio_format == "wav" else None,
+    )
+
+
+@app.post("/v1/audio/speech")
+def openai_audio_speech(req: OpenAISpeechRequest):
+    """OpenAI-compatible streaming speech synthesis endpoint backed by Qwen3-TTS."""
+    if not req.input.strip():
+        raise HTTPException(status_code=400, detail="input must not be empty")
+
+    audio_format = (req.response_format or "mp3").strip().lower()
+    if audio_format not in OPENAI_AUDIO_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"response_format must be one of: {', '.join(OPENAI_AUDIO_CONTENT_TYPES)}",
+        )
+
+    stream_format = (req.stream_format or "audio").strip().lower()
+    if stream_format not in {"audio", "sse"}:
+        raise HTTPException(status_code=400, detail="stream_format must be audio or sse")
+
+    user = req.user or "default"
+    user_dir = user_audio_dir(user)
+    resolved_voice = _resolve_openai_voice(
+        voice=req.voice,
+        instructions=req.instructions,
+        user=user,
+        user_dir=user_dir,
+    )
+    tts_req = TTSRequest(
+        text=req.input,
+        language=req.language or "Auto",
+        audio_format="pcm",
+        mode=resolved_voice["mode"],
+        model_size=_resolve_openai_tts_model_size(req.model),
+        reference_audio=resolved_voice["reference_audio"],
+        voice_description=resolved_voice["voice_description"],
+        voice_preset=resolved_voice["voice_preset"],
+        user=user,
+        cpu_mode=req.cpu_mode,
+    )
+    return _stream_tts_audio(
+        req=tts_req,
+        user_dir=user_dir,
+        audio_format=audio_format,
+        speed=req.speed,
+        stream_format=stream_format,
+        log_prefix="openai_speech",
     )
 
 

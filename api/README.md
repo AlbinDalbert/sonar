@@ -54,7 +54,53 @@ This relies on internals of the pinned `qwen-tts==0.1.1` (the talker forward pat
 ### `POST /api/tts/stream`
 Server-sent events with progress and a final base64 WAV payload. Useful for UI progress, but not memory-efficient for long text; prefer `/api/tts/audio-stream` for long text.
 
+### `POST /v1/audio/speech`
+OpenAI-compatible streaming text-to-speech endpoint backed by Qwen3-TTS. Streams audio incrementally as codec frames are generated (same frame-streaming pipeline as `/api/tts/audio-stream`).
+
+Request JSON:
+```json
+{
+  "model": "tts-1",
+  "input": "Hello from Qwen3-TTS",
+  "voice": "alloy",
+  "response_format": "mp3",
+  "speed": 1.0,
+  "stream_format": "audio"
+}
+```
+
 Fields:
+- `input` (required): text to synthesize
+- `model` (optional, default `tts-1`): `tts-1-hd`, `quality`, or anything containing `1.7b` selects the `1.7B` clone model; otherwise `0.6B` (`design` mode always uses `1.7B-VoiceDesign`)
+- `voice` (optional, default `alloy`): resolved in this order:
+  1. Explicit prefixes: `preset:<name>`, `clone:<filename>`, or `design:<description>`
+  2. Matching voice preset name from `/voice-presets` (`design` mode)
+  3. Matching reference audio filename or stem from `/reference-audio` (`clone` mode; e.g. `myvoice.wav` or `myvoice`)
+  4. Standard OpenAI voice name (`alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`, `onyx`, `nova`, `sage`, `shimmer`, `verse`, `marin`, `cedar`) or `default`. Uses `QWEN_OPENAI_DEFAULT_VOICE` if set, otherwise a built-in `design` description.
+  5. Multi-word plain text treated as a `design` voice description
+- `instructions` (optional): appended to the voice description in `design` mode (ignored in `clone` mode)
+- `response_format` (optional, default `mp3`): `mp3`, `opus`, `aac`, `flac`, `wav`, or `pcm` (24 kHz mono signed 16-bit little-endian)
+- `speed` (optional, default `1.0`): `0.25` to `4.0`
+- `stream_format` (optional, default `audio`):
+  - `audio`: streams raw audio bytes in the requested `response_format`
+  - `sse`: streams Server-Sent Events (`speech.audio.delta` with base64 audio chunks, then `speech.audio.done` with usage)
+- Optional Sonar extensions: `language` (default `Auto`), `user` (default `default`), `cpu_mode` (default `false`)
+
+Examples:
+```bash
+# Stream MP3 directly
+curl -N -X POST http://localhost:8888/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tts-1","voice":"alloy","input":"Hello from Sonar","response_format":"mp3"}' \
+  --output speech.mp3
+
+# Stream PCM via SSE (OpenAI gpt-4o-mini-tts style)
+curl -N -X POST http://localhost:8888/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini-tts","voice":"coral","instructions":"Speak calmly","input":"Hello via SSE","response_format":"pcm","stream_format":"sse"}'
+```
+
+Fields for `/api/tts` and `/api/tts/stream`:
 - `text` (required)
 - `language` (default `Auto`)
 - `audio_format` (`wav` or `ogg`)
@@ -185,6 +231,7 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8888
 - `QWEN_MAX_CHUNK_CHARS` (text chunk size for long text/streaming, default `160`)
 - `QWEN_STREAM_FIRST_FRAMES` (audio-stream: frames to collect before the first decode, default `4` = 320 ms)
 - `QWEN_STREAM_STEP_FRAMES` (audio-stream: minimum frames per later decode, default `4`; a slow decoder automatically batches more)
+- `QWEN_OPENAI_DEFAULT_VOICE` (optional fallback voice for `/v1/audio/speech` when a standard OpenAI voice name or `default` has no local preset or reference audio match; accepts a preset name, reference audio filename, prefixed voice, or description)
 - `QWEN_CORS_ORIGINS` (comma-separated, default `*`)
 - `QWEN_TRIM_CHUNK_SILENCE` (default `1`; trims generated leading/trailing silence at chunk boundaries)
 - `QWEN_TRIM_SILENCE_KEEP_MS` (default `60`)
