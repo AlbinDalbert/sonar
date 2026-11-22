@@ -10,15 +10,13 @@ spec:
     matchLabels:
       app: sonar-api
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 1
+    type: Recreate
   template:
     metadata:
       labels:
         app: sonar-api
     spec:
+      automountServiceAccountToken: false
       # NVIDIA container runtime (k3s + nvidia-container-toolkit). Patch out if your cluster
       # injects GPUs another way.
       runtimeClassName: nvidia
@@ -38,6 +36,7 @@ spec:
           volumeMounts:
             - name: model-cache
               mountPath: /models
+              readOnly: true
             - name: reference-audio
               mountPath: /reference-audio
           resources:

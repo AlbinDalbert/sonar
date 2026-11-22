@@ -79,6 +79,7 @@ ASR_LANGUAGE_ALIASES = {
 ASR_SAMPLE_RATE = 16000
 ASR_MAX_UPLOAD_MB = max(1, int(os.getenv("QWEN_ASR_MAX_UPLOAD_MB", "100")))
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
+VOICE_PRESETS_FILENAME = "voice_presets.json"
 MODEL_IDS = {
     "clone": {
         "fast": os.getenv("QWEN_CLONE_MODEL_ID_06", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
@@ -115,7 +116,6 @@ OPENAI_VOICE_DESCRIPTIONS = {
     "marin": "Clear, natural, relaxed modern female voice",
     "cedar": "Warm, natural, grounded male voice",
 }
-model_status = {"state": "idle", "kind": None, "model_id": None, "device": None}  # idle | loading | ready
 QWEN_MEMORY_PATCH_ENABLED = False
 # Per-thread hook for frame-level streaming. While set, the patched talker
 # forward hands every generated codec frame to `_frame_sink.fn` (see
@@ -313,7 +313,7 @@ class QwenService:
     def __init__(self) -> None:
         self.device = os.getenv("QWEN_DEVICE", "cuda:0")
         self.dtype = os.getenv("QWEN_DTYPE", "bfloat16")
-        self.attn_impl = os.getenv("QWEN_ATTN_IMPL", "flash_attention_2")
+        self.attn_impl = os.getenv("QWEN_ATTN_IMPL", "sdpa")
         self.cpu_dtype = os.getenv("QWEN_CPU_DTYPE", "float32")
         self.cpu_attn_impl = os.getenv("QWEN_CPU_ATTN_IMPL", "sdpa")
         # Force local-only model resolution by default so runtime never depends on
@@ -346,6 +346,7 @@ class QwenService:
         self._model_kind: Optional[str] = None
         self._model_id: Optional[str] = None
         self._model_device: Optional[str] = None
+        self._status = {"state": "idle", "kind": None, "model_id": None, "device": None}
         self._unload_timer: Optional[threading.Timer] = None
         self._idle_generation: int = 0
         self._speaker_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
@@ -438,6 +439,18 @@ class QwenService:
         self._unload_timer = timer
         timer.start()
 
+    def status_snapshot(self) -> dict:
+        return dict(self._status)
+
+    def _set_status_locked(
+        self,
+        state: str,
+        kind: Optional[str] = None,
+        model_id: Optional[str] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        self._status = {"state": state, "kind": kind, "model_id": model_id, "device": device}
+
     def _on_idle_unload_timeout(self, expected_gen: int) -> None:
         if not self.request_lock.acquire(blocking=False):
             return
@@ -451,7 +464,7 @@ class QwenService:
                 unloaded_model_id = self._model_id
                 had_model = self._model is not None
                 self._unload_model_locked()
-                model_status.update({"state": "idle", "kind": None, "model_id": None, "device": None})
+                self._set_status_locked("idle")
         finally:
             self.request_lock.release()
 
@@ -492,7 +505,7 @@ class QwenService:
                     unloaded_model_id = self._model_id
                     had_model = self._model is not None
                     self._unload_model_locked()
-                    model_status.update({"state": "idle", "kind": None, "model_id": None, "device": None})
+                    self._set_status_locked("idle")
             else:
                 # Release intermediate generation buffers right away while
                 # keeping the loaded model warm until the idle timer fires.
@@ -545,7 +558,7 @@ class QwenService:
             if kind == "asr" and Qwen3ASRModel is None:
                 raise HTTPException(status_code=501, detail="ASR unavailable: qwen-asr package is not installed")
 
-            model_status.update({"state": "loading", "kind": kind, "model_id": model_id, "device": model_device})
+            self._set_status_locked("loading", kind, model_id, model_device)
             self._unload_model_locked()
 
             try:
@@ -572,7 +585,7 @@ class QwenService:
                 # A failed load can leave a partially constructed model and
                 # CUDA cache allocations behind. Release both before replying.
                 self._unload_model_locked()
-                model_status.update({"state": "idle", "kind": None, "model_id": None, "device": None})
+                self._set_status_locked("idle")
                 if model_device.startswith("cuda") and is_cuda_out_of_memory(e):
                     print(json.dumps({
                         "event": f"{kind}_model_load_gpu_busy",
@@ -587,7 +600,7 @@ class QwenService:
             self._model_kind = kind
             self._model_id = model_id
             self._model_device = model_device
-            model_status.update({"state": "ready", "kind": kind, "model_id": model_id, "device": model_device})
+            self._set_status_locked("ready", kind, model_id, model_device)
             return self._model
 
     def unload_model(self, reason: str = "manual") -> None:
@@ -599,7 +612,7 @@ class QwenService:
                     unloaded_model_id = self._model_id
                     had_model = self._model is not None
                     self._unload_model_locked()
-                    model_status.update({"state": "idle", "kind": None, "model_id": None, "device": None})
+                    self._set_status_locked("idle")
 
         if had_model:
             print(json.dumps({
@@ -637,15 +650,15 @@ class QwenService:
         self.unload_model(reason="reset")
 
     def resolve_reference_audio(self, filename: str, user_dir: Path) -> Path:
-        candidate = (user_dir / filename).resolve()
-        if not str(candidate).startswith(str(user_dir.resolve())):
-            raise HTTPException(status_code=400, detail="Invalid filename")
+        safe_name, candidate = _resolve_reference_path(filename, user_dir)
         if not candidate.is_file():
-            raise HTTPException(status_code=404, detail=f"Reference audio not found: {filename}")
+            raise HTTPException(status_code=404, detail=f"Reference audio not found: {safe_name}")
         return candidate
 
     def validate_request(self, req: TTSRequest, user_dir: Path) -> None:
         """Validate request fields before waiting for the GPU lock."""
+        if not (req.text or "").strip():
+            raise HTTPException(status_code=400, detail="text must not be empty")
         mode = (req.mode or "clone").strip().lower()
         if mode == "clone":
             if not req.reference_audio:
@@ -1250,6 +1263,31 @@ def _group_parts(parts: list[str], max_chars: int, sep: str = " ") -> list[str]:
     return result
 
 
+def _split_oversized_part(text: str, max_chars: int) -> list[str]:
+    """Break a single long sentence on clauses, words, or characters."""
+    if len(text) <= max_chars:
+        return [text]
+
+    clauses = [c.strip() for c in re.split(r"(?<=[,;:])\s+|(?<=[，、；：])", text) if c.strip()]
+    pieces = _group_parts(clauses, max_chars) if len(clauses) > 1 else [text]
+
+    result: list[str] = []
+    for piece in pieces:
+        if len(piece) <= max_chars:
+            result.append(piece)
+            continue
+        words = piece.split()
+        if len(words) > 1:
+            for word_group in _group_parts(words, max_chars):
+                if len(word_group) <= max_chars:
+                    result.append(word_group)
+                else:
+                    result.extend(word_group[i:i + max_chars] for i in range(0, len(word_group), max_chars))
+        else:
+            result.extend(piece[i:i + max_chars] for i in range(0, len(piece), max_chars))
+    return result
+
+
 def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     """Split text into contextually-aware chunks.
 
@@ -1259,7 +1297,8 @@ def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
       3. Split on paragraph breaks (double newline).
       4. If a paragraph is still too long, split on single newlines first
          (preferred — natural line breaks mid-paragraph).
-      5. If a line-group is still too long, fall back to sentence boundaries.
+      5. If a line-group is still too long, fall back to sentence boundaries
+         (including CJK punctuation), then clause/word/character splits.
     """
     text = normalize_text(text)
 
@@ -1284,11 +1323,57 @@ def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
             if len(group) <= max_chars:
                 chunks.append(group)
             else:
-                # Fall back to sentence boundaries
-                sentences = re.split(r"(?<=[.!?])\s+", group)
-                chunks.extend(_group_parts(sentences, max_chars))
+                # Fall back to sentence boundaries (ASCII + CJK)
+                sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|(?<=[。！？])", group) if s.strip()]
+                expanded: list[str] = []
+                for sentence in sentences:
+                    expanded.extend(_split_oversized_part(sentence, max_chars))
+                chunks.extend(_group_parts(expanded, max_chars))
 
     return chunks if chunks else [text]
+
+
+def _is_internal_reference_file(filename: str) -> bool:
+    return filename == VOICE_PRESETS_FILENAME or filename.endswith(".meta.json") or filename.startswith(".")
+
+
+def _validate_reference_filename(filename: str) -> str:
+    cleaned = (filename or "").strip()
+    if (
+        not cleaned
+        or "/" in cleaned
+        or "\\" in cleaned
+        or cleaned in {".", ".."}
+        or _is_internal_reference_file(cleaned)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return cleaned
+
+
+def _resolve_reference_path(filename: str, user_dir: Path) -> tuple[str, Path]:
+    safe_name = _validate_reference_filename(filename)
+    base_dir = user_dir.resolve()
+    candidate = (base_dir / safe_name).resolve()
+    if not candidate.is_relative_to(base_dir):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return safe_name, candidate
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def meta_path_for(directory: Path, filename: str) -> Path:
@@ -1299,7 +1384,7 @@ def write_meta(directory: Path, filename: str, source: str, description: Optiona
     payload = {"source": source}
     if description is not None:
         payload["description"] = description
-    meta_path_for(directory, filename).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_text(meta_path_for(directory, filename), json.dumps(payload, ensure_ascii=False))
 
 
 def read_meta(directory: Path, filename: str):
@@ -1333,7 +1418,7 @@ def user_audio_dir(user: str) -> Path:
 
 
 def user_presets_path(user: str) -> Path:
-    return user_audio_dir(user) / "voice_presets.json"
+    return user_audio_dir(user) / VOICE_PRESETS_FILENAME
 
 
 voice_presets_lock = threading.Lock()
@@ -1367,8 +1452,8 @@ def load_voice_presets(path: Path) -> dict[str, dict]:
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Corrupt voice presets file: {e}") from e
 
     presets: dict[str, dict] = {}
     if isinstance(raw, list):
@@ -1396,7 +1481,7 @@ def load_voice_presets(path: Path) -> dict[str, dict]:
 
 def save_voice_presets(path: Path, presets: dict[str, dict]):
     ordered = [presets[name] for name in sorted(presets)]
-    path.write_text(json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(path, json.dumps(ordered, ensure_ascii=False, indent=2))
 
 
 def apply_voice_preset(req: TTSRequest) -> TTSRequest:
@@ -1572,11 +1657,12 @@ def decode_asr_audio(data: bytes, filename: str = "") -> tuple[np.ndarray, int]:
 
 @app.get("/status")
 def status():
+    snap = svc.status_snapshot()
     return {
-        "model_state": model_status["state"],
-        "model_kind": model_status["kind"],
-        "model_id": model_status["model_id"],
-        "device": model_status["device"],
+        "model_state": snap["state"],
+        "model_kind": snap["kind"],
+        "model_id": snap["model_id"],
+        "device": snap["device"],
         "uptime_s": int(time.time() - start_time),
         "cuda": cuda_memory_snapshot(),
     }
@@ -1584,28 +1670,31 @@ def status():
 
 @app.get("/readyz")
 def readyz():
-    if model_status["state"] == "ready":
+    snap = svc.status_snapshot()
+    if snap["state"] == "ready":
         return {
             "ready": True,
-            "model_kind": model_status["kind"],
-            "model_id": model_status["model_id"],
-            "device": model_status["device"],
+            "model_kind": snap["kind"],
+            "model_id": snap["model_id"],
+            "device": snap["device"],
         }
     return JSONResponse(
         status_code=503,
-        content={"ready": False, "reason": model_status["state"]},
+        content={"ready": False, "reason": snap["state"]},
     )
 
 
 @app.get("/info")
 def info():
+    snap = svc.status_snapshot()
+    ready = snap["state"] == "ready"
     return {
         "models": MODEL_IDS,
         "modes": ["clone", "design"],
         "sizes": ["fast", "quality"],
-        "current_model": svc._model_id,
-        "current_model_kind": svc._model_kind,
-        "current_device": svc._model_device,
+        "current_model": snap["model_id"] if ready else None,
+        "current_model_kind": snap["kind"] if ready else None,
+        "current_device": snap["device"] if ready else None,
         "supported_languages": SUPPORTED_LANGUAGES,
         "asr": {
             "available": Qwen3ASRModel is not None,
@@ -1664,9 +1753,7 @@ def list_reference_audio(user: str = Query(default="default")):
     dir_path = user_audio_dir(user)
     files = []
     for p in sorted(dir_path.iterdir()):
-        if not p.is_file() or p.name.startswith("."):
-            continue
-        if p.name.endswith(".meta.json"):
+        if not p.is_file() or _is_internal_reference_file(p.name):
             continue
         meta = read_meta(dir_path, p.name)
         files.append(
@@ -1683,12 +1770,10 @@ def list_reference_audio(user: str = Query(default="default")):
 @app.post("/reference-audio/upload")
 async def upload_reference_audio(file: UploadFile = File(...), user: str = Query(default="default")):
     dir_path = user_audio_dir(user)
-    filename = Path(file.filename or "").name
-    if not filename:
+    raw_name = (file.filename or "").strip()
+    if not raw_name:
         raise HTTPException(status_code=400, detail="Missing filename")
-    target = (dir_path / filename).resolve()
-    if not str(target).startswith(str(dir_path.resolve())):
-        raise HTTPException(status_code=400, detail="Invalid filename")
+    filename, target = _resolve_reference_path(Path(raw_name).name, dir_path)
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
@@ -1700,13 +1785,10 @@ async def upload_reference_audio(file: UploadFile = File(...), user: str = Query
 @app.post("/reference-audio/save-design")
 def save_design_reference_audio(req: SaveDesignRequest, user: str = Query(default="default")):
     dir_path = user_audio_dir(user)
-    filename = Path(req.filename or "").name
-    if not filename:
+    raw_name = (req.filename or "").strip()
+    if not raw_name:
         raise HTTPException(status_code=400, detail="Missing filename")
-
-    target = (dir_path / filename).resolve()
-    if not str(target).startswith(str(dir_path.resolve())):
-        raise HTTPException(status_code=400, detail="Invalid filename")
+    filename, target = _resolve_reference_path(raw_name, dir_path)
 
     audio_b64 = req.audio_b64.strip()
     if "," in audio_b64 and audio_b64.lower().startswith("data:"):
@@ -1947,15 +2029,15 @@ def _find_voice_preset_by_voice(voice: str, user: str) -> Optional[dict]:
 
 
 def _find_reference_audio_by_voice(voice: str, user_dir: Path) -> Optional[str]:
-    if not voice or "/" in voice or "\\" in voice or voice.startswith(".") or ".." in voice:
+    if not voice or "/" in voice or "\\" in voice or voice in {".", ".."} or _is_internal_reference_file(voice):
         return None
     exact = user_dir / voice
-    if exact.is_file() and not exact.name.endswith(".meta.json"):
+    if exact.is_file() and not _is_internal_reference_file(exact.name):
         return exact.name
     lowered = voice.lower()
     ci_match: Optional[str] = None
     for p in sorted(user_dir.iterdir()):
-        if not p.is_file() or p.name.startswith(".") or p.name.endswith(".meta.json"):
+        if not p.is_file() or _is_internal_reference_file(p.name):
             continue
         if p.stem == voice:
             return p.name
@@ -2294,12 +2376,19 @@ def _stream_tts_audio(
             }), flush=True)
         except Exception as e:
             stream_error[0] = True
+            detail = str(getattr(e, "detail", e))
             print(json.dumps({
                 "event": f"{log_prefix}_error",
-                "detail": str(getattr(e, "detail", e)),
+                "detail": detail,
                 "chunks": n_chunks,
                 "cuda": cuda_memory_snapshot(),
             }), flush=True)
+            if stream_format == "sse":
+                err_payload = {"type": "error", "error": {"message": detail}}
+                if isinstance(e, HTTPException):
+                    err_payload["error"]["status_code"] = e.status_code
+                yield f"event: error\ndata: {json.dumps(err_payload)}\n\n".encode("utf-8")
+                return
             raise
 
     def close_stream() -> None:

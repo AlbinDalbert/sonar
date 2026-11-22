@@ -3,7 +3,6 @@
 FastAPI wrapper around **Qwen3-TTS** and **Qwen3-ASR**: speech synthesis, streaming, voice cloning, voice design, and speech-to-text transcription.
 
 - Default port: `8888`
-- Default model: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
 - Default response format: `wav`
 
 ## Endpoints
@@ -175,9 +174,6 @@ Process health.
 ### `GET /readyz`
 Model readiness.
 
-### `GET /speakers`
-Supported speakers (if model supports it).
-
 ### `GET /info`
 Returns the model IDs, modes, sizes, loaded model, supported languages and generation settings.
 
@@ -209,13 +205,11 @@ pip install -U pip
 pip install -r requirements.txt
 pip install --no-deps qwen-tts==0.1.1
 
-export QWEN_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8888
 ```
 
 ## Environment variables
 
-- `QWEN_MODEL_ID`
 - `QWEN_DEVICE`
 - `QWEN_DTYPE`
 - `QWEN_ATTN_IMPL` (default `sdpa`; use `eager` if SDPA causes trouble)

@@ -18,6 +18,7 @@
   let voice = $state('')
   let loadError = $state('')
   let languages = $state.raw(FALLBACK_LANGUAGES)
+  let languagesLoaded = false
   let status = $state.raw<Status | null>(null)
   let offline = $state(false)
 
@@ -58,11 +59,22 @@
     loadVoices()
   }
 
+  async function loadInfo() {
+    try {
+      const info = await getInfo()
+      languages = info.supported_languages
+      languagesLoaded = true
+    } catch {}
+  }
+
   async function pollStatus() {
     if (document.hidden) return
     try {
+      const wasOffline = offline
       status = await getStatus()
       offline = false
+      if (wasOffline || loadError) loadVoices()
+      if (!languagesLoaded) loadInfo()
     } catch {
       offline = true
     }
@@ -71,9 +83,7 @@
   onMount(() => {
     loadVoices()
     pollStatus()
-    getInfo()
-      .then((info) => (languages = info.supported_languages))
-      .catch(() => {})
+    loadInfo()
     const timer = setInterval(pollStatus, 5000)
     return () => clearInterval(timer)
   })

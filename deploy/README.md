@@ -49,7 +49,6 @@ patches:
 small (~3 GiB) GPU, keep the auxiliary modules on CPU:
 
 ```sh
-QWEN_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 QWEN_MAX_CHUNK_CHARS=220
 QWEN_MAX_NEW_TOKENS=192
 QWEN_MAX_NEW_TOKENS_PER_CHAR=1.0
@@ -61,7 +60,6 @@ QWEN_SPEAKER_ENCODER_DEVICE=cpu
 For ~8 GiB, keep them on the GPU for lower latency:
 
 ```sh
-QWEN_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 QWEN_MAX_CHUNK_CHARS=250
 QWEN_MAX_NEW_TOKENS=512
 QWEN_MAX_NEW_TOKENS_PER_CHAR=2.0
