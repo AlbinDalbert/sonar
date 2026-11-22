@@ -43,7 +43,7 @@
       return { ...base, mode: 'design', model_size: 'quality', voice_description: description.trim() }
     }
     if (voice.startsWith('preset:')) {
-      return { ...base, mode: 'design', model_size: 'quality', voice_preset: voiceName(voice) }
+      return { ...base, mode: 'design', model_size: 'quality', voice_preset: voice.slice('preset:'.length) }
     }
     return { ...base, mode: 'clone', model_size: modelSize, reference_audio: voice.slice('clone:'.length) }
   }
@@ -179,7 +179,6 @@
             <select bind:value={modelSize}>
               <option value="fast">Fast</option>
               <option value="quality">Quality</option>
-              <option value="auto">Auto</option>
             </select>
           {/if}
         </label>

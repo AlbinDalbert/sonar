@@ -1,6 +1,6 @@
 # sonar api
 
-FastAPI wrapper around **Qwen3-TTS**: synthesis, streaming, voice cloning and voice design.
+FastAPI wrapper around **Qwen3-TTS** and **Qwen3-ASR**: speech synthesis, streaming, voice cloning, voice design, and speech-to-text transcription.
 
 - Default port: `8888`
 - Default model: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
@@ -59,12 +59,59 @@ Fields:
 - `language` (default `Auto`)
 - `audio_format` (`wav` or `ogg`)
 - `mode` (`clone` or `design`)
-- `model_size` (`fast`, `quality`, or `auto`; design uses `quality`)
-  - `auto` selects `quality` when free CUDA VRAM is >= `QWEN_AUTO_QUALITY_MIN_VRAM_MB` (default `3000`), otherwise `fast`
+- `model_size` (`fast` or `quality`, default `fast`; `design` always uses `quality`)
 - `reference_audio` (required in `clone` mode)
 - `voice_description` (required in `design` mode unless `voice_preset` is provided)
 - `voice_preset` (optional preset name from `/voice-presets`; overrides `voice_description` and forces `design` mode)
 - `cpu_mode` (default `false`; when `true`, runs the complete TTS pipeline on CPU with no GPU fallback)
+
+### `POST /api/asr`
+Transcribe an uploaded audio file with **Qwen3-ASR** (`Qwen/Qwen3-ASR-0.6B` or `Qwen/Qwen3-ASR-1.7B`).
+
+Multipart form fields:
+- `file` (required; WAV, MP3, M4A, OGG/Opus, WebM, FLAC, or any format `ffmpeg` can decode)
+- `model_size` (`fast` or `quality`, default `fast` = `0.6B`; `quality` = `1.7B`)
+- `language` (optional; omit or pass `Auto` for automatic detection; accepts full names like `English` or ISO codes like `en`, `sv`)
+- `context` (optional domain vocabulary / prompt hint)
+- `cpu_mode` (default `false`; explicit CPU-only execution, no automatic fallback)
+
+Example:
+```bash
+curl -X POST http://localhost:8888/api/asr \
+  -F "file=@recording.m4a" \
+  -F "model_size=fast"
+```
+
+Response JSON:
+```json
+{
+  "text": "Hello from Qwen3-ASR.",
+  "language": "English",
+  "model_id": "Qwen/Qwen3-ASR-0.6B",
+  "model_size": "fast",
+  "duration_s": 2.41,
+  "t_total_ms": 412,
+  "t_transcribe_ms": 380
+}
+```
+
+### `POST /v1/audio/transcriptions`
+OpenAI Whisper-compatible transcription endpoint backed by Qwen3-ASR for drop-in use with external apps.
+
+Multipart form fields:
+- `file` (required)
+- `model` (optional; `quality` or anything containing `1.7b` selects `Qwen/Qwen3-ASR-1.7B`, otherwise `Qwen/Qwen3-ASR-0.6B`, including `whisper-1`)
+- `language` (optional; ISO-639 codes like `en`/`sv` or full language names)
+- `prompt` (optional; forwarded as Qwen3-ASR `context`)
+- `response_format` (`json`, `text`, or `verbose_json`; default `json`)
+- `cpu_mode` (optional boolean, default `false`)
+
+Example:
+```bash
+curl -X POST http://localhost:8888/v1/audio/transcriptions \
+  -F "file=@recording.wav" \
+  -F "model=whisper-1"
+```
 
 ### Errors
 
@@ -114,6 +161,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
+pip install --no-deps qwen-tts==0.1.1
 
 export QWEN_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8888
@@ -127,7 +175,13 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8888
 - `QWEN_ATTN_IMPL` (default `sdpa`; use `eager` if SDPA causes trouble)
 - `QWEN_CPU_DTYPE` (default `float32`; used when request `cpu_mode=true`)
 - `QWEN_CPU_ATTN_IMPL` (default `sdpa`; used when request `cpu_mode=true`)
-- `QWEN_AUTO_QUALITY_MIN_VRAM_MB` (used when `model_size=auto`, default `3000`)
+- `QWEN_IDLE_UNLOAD_SECONDS` (seconds to keep a loaded model warm after a request finishes before unloading it, default `5`; set `0` to unload immediately)
+- `QWEN_SPEAKER_CACHE_MAX_ITEMS` (in-memory LRU cache size for extracted clone speaker embeddings, default `64`; set `0` to disable)
+- `QWEN_ASR_MODEL_ID_06` (default `Qwen/Qwen3-ASR-0.6B`)
+- `QWEN_ASR_MODEL_ID_17` (default `Qwen/Qwen3-ASR-1.7B`)
+- `QWEN_ASR_MAX_NEW_TOKENS` (max output tokens per ASR chunk, default `2048`)
+- `QWEN_ASR_MAX_INFERENCE_BATCH_SIZE` (internal ASR batch cap for >20 min split audio, default `1`)
+- `QWEN_ASR_MAX_UPLOAD_MB` (maximum ASR audio upload size in MB, default `100`)
 - `QWEN_MAX_CHUNK_CHARS` (text chunk size for long text/streaming, default `160`)
 - `QWEN_STREAM_FIRST_FRAMES` (audio-stream: frames to collect before the first decode, default `4` = 320 ms)
 - `QWEN_STREAM_STEP_FRAMES` (audio-stream: minimum frames per later decode, default `4`; a slow decoder automatically batches more)
@@ -172,11 +226,14 @@ QWEN_MAX_NEW_TOKENS_BUFFER=64
 
 ## Notes
 
-- TTS models are loaded on demand and explicitly unloaded after every completed TTS request, including streamed requests and failed generations. This releases their CUDA allocations; the next request incurs model load time.
+- TTS and ASR models share one GPU slot, are loaded on demand, and flush their generation CUDA cache after each completed request. The loaded model stays warm for `QWEN_IDLE_UNLOAD_SECONDS` (default `5` seconds) before being unloaded to release its VRAM for other GPU workloads (failed requests and `POST /reset` unload immediately). Clone speaker embeddings stay cached in CPU RAM across idle unloads and are invalidated automatically when a reference audio file changes.
+- Because the container runs offline (`HF_HUB_OFFLINE=1`), pre-download `Qwen/Qwen3-ASR-0.6B` and/or `Qwen/Qwen3-ASR-1.7B` into the Hugging Face cache directory before calling `/api/asr` or `/v1/audio/transcriptions`.
 - `POST /reference-audio/upload` requires `python-multipart`.
 - If FlashAttention2 fails, set `QWEN_ATTN_IMPL=eager`.
 
 ## References
 
 - Qwen3-TTS: https://github.com/QwenLM/Qwen3-TTS
-- HF collection: https://huggingface.co/collections/Qwen/qwen3-tts
+- Qwen3-ASR: https://github.com/QwenLM/Qwen3-ASR
+- HF TTS collection: https://huggingface.co/collections/Qwen/qwen3-tts
+- HF ASR collection: https://huggingface.co/collections/Qwen/qwen3-asr

@@ -1,9 +1,12 @@
 import base64
+from collections import OrderedDict
 import contextlib
 import io
 import json
 import os
 import re
+import subprocess
+import tempfile
 import threading
 import gc
 import time
@@ -15,17 +18,65 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn.functional as F
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from qwen_tts import Qwen3TTSModel
 from transformers import LogitsProcessor, LogitsProcessorList
 
+try:
+    from qwen_asr import Qwen3ASRModel
+except ImportError:
+    Qwen3ASRModel = None
+
 SUPPORTED_LANGUAGES = [
     "Auto", "English", "Chinese", "Japanese", "Korean",
     "French", "German", "Spanish", "Italian", "Portuguese", "Arabic", "Russian",
 ]
+ASR_SUPPORTED_LANGUAGES = [
+    "Chinese", "Cantonese", "English", "Arabic", "German", "French",
+    "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
+    "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay",
+    "Dutch", "Swedish", "Danish", "Finnish", "Polish", "Czech",
+    "Filipino", "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
+]
+_ASR_LANGUAGE_BY_LOWER = {lang.lower(): lang for lang in ASR_SUPPORTED_LANGUAGES}
+ASR_LANGUAGE_ALIASES = {
+    "zh": "Chinese",
+    "yue": "Cantonese",
+    "en": "English",
+    "ar": "Arabic",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "id": "Indonesian",
+    "it": "Italian",
+    "ko": "Korean",
+    "ru": "Russian",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "ja": "Japanese",
+    "tr": "Turkish",
+    "hi": "Hindi",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "pl": "Polish",
+    "cs": "Czech",
+    "fil": "Filipino",
+    "tl": "Filipino",
+    "fa": "Persian",
+    "el": "Greek",
+    "ro": "Romanian",
+    "hu": "Hungarian",
+    "mk": "Macedonian",
+}
+ASR_SAMPLE_RATE = 16000
+ASR_MAX_UPLOAD_MB = max(1, int(os.getenv("QWEN_ASR_MAX_UPLOAD_MB", "100")))
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
 MODEL_IDS = {
     "clone": {
@@ -36,7 +87,11 @@ MODEL_IDS = {
         "quality": os.getenv("QWEN_DESIGN_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
     },
 }
-model_status = {"state": "idle", "model_id": None, "device": None}  # idle | loading | ready
+ASR_MODEL_IDS = {
+    "fast": os.getenv("QWEN_ASR_MODEL_ID_06", "Qwen/Qwen3-ASR-0.6B"),
+    "quality": os.getenv("QWEN_ASR_MODEL_ID_17", "Qwen/Qwen3-ASR-1.7B"),
+}
+model_status = {"state": "idle", "kind": None, "model_id": None, "device": None}  # idle | loading | ready
 QWEN_MEMORY_PATCH_ENABLED = False
 # Per-thread hook for frame-level streaming. While set, the patched talker
 # forward hands every generated codec frame to `_frame_sink.fn` (see
@@ -136,7 +191,7 @@ class TTSRequest(BaseModel):
     language: str = Field(default="Auto", description="Language or Auto")
     audio_format: str = Field(default="wav", description="wav | ogg | pcm (pcm: /api/tts/audio-stream only)")
     mode: str = Field(default="clone", description="clone | design")
-    model_size: str = Field(default="fast", description="fast | quality | auto")
+    model_size: str = Field(default="fast", description="fast | quality")
     reference_audio: Optional[str] = Field(default=None, description="Filename from /reference-audio when mode=clone")
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
     voice_preset: Optional[str] = Field(default=None, description="Named voice preset to resolve into voice_description")
@@ -160,6 +215,63 @@ class ResetRequest(BaseModel):
     restart: bool = Field(default=False, description="Restart process after reset")
 
 
+class RequestSession:
+    """Exclusive model-use lease for one TTS request.
+
+    Prevents overlapping requests from swapping or unloading each other's
+    model, flushes generation CUDA cache once the total request completes,
+    and hands the loaded model off to the idle-unload timer (or unloads
+    immediately on error or when QWEN_IDLE_UNLOAD_SECONDS <= 0).
+    """
+
+    def __init__(self, service: "QwenService") -> None:
+        self._service = service
+        self._finished = False
+
+    def finish(self, unload_now: bool = False) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._service._finish_request(unload_now=unload_now)
+
+    def __enter__(self) -> "RequestSession":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.finish(unload_now=exc_type is not None)
+
+
+class _ManagedStream:
+    """Iterator wrapper guaranteeing `on_close` runs once on end, abort, or GC."""
+
+    def __init__(self, gen, on_close) -> None:
+        self._gen = gen
+        self._on_close = on_close
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._gen)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._gen.close()
+        finally:
+            self._on_close()
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class QwenService:
     def __init__(self) -> None:
         self.device = os.getenv("QWEN_DEVICE", "cuda:0")
@@ -170,10 +282,15 @@ class QwenService:
         # Force local-only model resolution by default so runtime never depends on
         # live Hugging Face API checks (works with pre-populated HF cache).
         self.local_files_only = os.getenv("QWEN_LOCAL_FILES_ONLY", "1").lower() not in {"0", "false", "no"}
-        self.auto_quality_min_vram_mb = int(os.getenv("QWEN_AUTO_QUALITY_MIN_VRAM_MB", "3000"))
         self.max_new_tokens = int(os.getenv("QWEN_MAX_NEW_TOKENS", "192"))
         self.max_new_tokens_per_char = float(os.getenv("QWEN_MAX_NEW_TOKENS_PER_CHAR", "1.0"))
         self.max_new_tokens_buffer = int(os.getenv("QWEN_MAX_NEW_TOKENS_BUFFER", "48"))
+        self.asr_max_new_tokens = max(64, int(os.getenv("QWEN_ASR_MAX_NEW_TOKENS", "2048")))
+        self.asr_max_inference_batch_size = max(1, int(os.getenv("QWEN_ASR_MAX_INFERENCE_BATCH_SIZE", "1")))
+        # Keep the model warm briefly for back-to-back requests, then unload so
+        # other GPU workloads get VRAM back quickly. Set 0 to unload immediately.
+        self.idle_unload_seconds = max(0.0, float(os.getenv("QWEN_IDLE_UNLOAD_SECONDS", "5")))
+        self.speaker_cache_max_items = max(0, int(os.getenv("QWEN_SPEAKER_CACHE_MAX_ITEMS", "64")))
         # On ~3 GiB GPUs the 0.6B talker can fit, but the auxiliary vocoder /
         # speech tokenizer and speaker encoder leave almost no generation
         # headroom. Keep those aux modules on CPU by default; only the talker
@@ -185,12 +302,17 @@ class QwenService:
         # qwen's parameter is inverted: non_streaming_mode=False enables its
         # lower-latency streaming-text path. Keep false by default.
         self.non_streaming_mode = os.getenv("QWEN_NON_STREAMING_MODE", "0").lower() in {"1", "true", "yes"}
+        self.request_lock = threading.Lock()
         self.lock = threading.Lock()
-        self.load_lock = threading.Lock()
         self.generation_lock = threading.Lock()
         self._model = None
+        self._model_kind: Optional[str] = None
         self._model_id: Optional[str] = None
         self._model_device: Optional[str] = None
+        self._unload_timer: Optional[threading.Timer] = None
+        self._idle_generation: int = 0
+        self._speaker_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+        self._speaker_cache_lock = threading.Lock()
 
     def _torch_dtype(self, device: str):
         dtype_name = self.cpu_dtype if device == "cpu" else self.dtype
@@ -263,31 +385,144 @@ class QwenService:
         )
         cleanup_generation_memory()
 
+    def _cancel_idle_unload_locked(self) -> None:
+        self._idle_generation += 1
+        if self._unload_timer is not None:
+            self._unload_timer.cancel()
+            self._unload_timer = None
+
+    def _schedule_idle_unload_locked(self) -> None:
+        self._cancel_idle_unload_locked()
+        if self.idle_unload_seconds <= 0 or self._model is None:
+            return
+        expected_gen = self._idle_generation
+        timer = threading.Timer(self.idle_unload_seconds, self._on_idle_unload_timeout, args=(expected_gen,))
+        timer.daemon = True
+        self._unload_timer = timer
+        timer.start()
+
+    def _on_idle_unload_timeout(self, expected_gen: int) -> None:
+        if not self.request_lock.acquire(blocking=False):
+            return
+        unloaded_model_id = None
+        had_model = False
+        try:
+            with self.lock:
+                if self._idle_generation != expected_gen:
+                    return
+                self._unload_timer = None
+                unloaded_model_id = self._model_id
+                had_model = self._model is not None
+                self._unload_model_locked()
+                model_status.update({"state": "idle", "kind": None, "model_id": None, "device": None})
+        finally:
+            self.request_lock.release()
+
+        if had_model:
+            print(json.dumps({
+                "event": "tts_model_unloaded",
+                "reason": "idle",
+                "model_id": unloaded_model_id,
+                "cuda": cuda_memory_snapshot(),
+            }), flush=True)
+
     def _unload_model_locked(self):
         if self._model is not None:
             del self._model
             self._model = None
+        self._model_kind = None
         self._model_id = None
         self._model_device = None
         cleanup_generation_memory()
 
-    def get_model(self, model_id: str, cpu_mode: bool = False):
-        model_device = "cpu" if cpu_mode else self.device.strip().lower()
-        if self._model is not None and self._model_id == model_id and self._model_device == model_device:
-            return self._model
+    def begin_request(self) -> RequestSession:
+        """Acquire exclusive model access for one TTS or ASR request."""
+        self.request_lock.acquire()
+        with self.lock:
+            self._cancel_idle_unload_locked()
+        return RequestSession(self)
 
-        if not self.load_lock.acquire(blocking=False):
-            raise HTTPException(status_code=409, detail="Model load already in progress")
+    def request_session(self) -> RequestSession:
+        return self.begin_request()
 
+    def _finish_request(self, unload_now: bool = False) -> None:
+        unloaded_model_id = None
+        had_model = False
         try:
-            with self.lock:
-                if self._model is not None and self._model_id == model_id and self._model_device == model_device:
-                    return self._model
+            if unload_now or self.idle_unload_seconds <= 0:
+                with self.lock:
+                    self._cancel_idle_unload_locked()
+                    unloaded_model_id = self._model_id
+                    had_model = self._model is not None
+                    self._unload_model_locked()
+                    model_status.update({"state": "idle", "kind": None, "model_id": None, "device": None})
+            else:
+                # Release intermediate generation buffers right away while
+                # keeping the loaded model warm until the idle timer fires.
+                cleanup_generation_memory()
+                with self.lock:
+                    if self._model is not None:
+                        self._schedule_idle_unload_locked()
+        finally:
+            self.request_lock.release()
 
-                model_status.update({"state": "loading", "model_id": model_id, "device": model_device})
-                self._unload_model_locked()
+        if had_model:
+            print(json.dumps({
+                "event": "tts_model_unloaded",
+                "reason": "error" if unload_now else "immediate",
+                "model_id": unloaded_model_id,
+                "cuda": cuda_memory_snapshot(),
+            }), flush=True)
 
-                try:
+    def release_idle_cuda_memory(self, min_mb: int) -> None:
+        if self.loaded_model() is not None:
+            return
+        if torch.cuda.memory_reserved() < min_mb * 1024 * 1024:
+            return
+        if not self.request_lock.acquire(blocking=False):
+            return
+        try:
+            if self.loaded_model() is not None:
+                return
+            before_mb = int(torch.cuda.memory_reserved() / (1024 * 1024))
+            cleanup_generation_memory()
+        finally:
+            self.request_lock.release()
+        print(json.dumps({
+            "event": "tts_idle_cuda_released",
+            "reserved_before_mb": before_mb,
+            "cuda": cuda_memory_snapshot(),
+        }), flush=True)
+
+    def get_model(self, model_id: str, cpu_mode: bool = False, kind: str = "tts"):
+        model_device = "cpu" if cpu_mode else self.device.strip().lower()
+        with self.lock:
+            if (
+                self._model is not None
+                and self._model_kind == kind
+                and self._model_id == model_id
+                and self._model_device == model_device
+            ):
+                return self._model
+
+            if kind == "asr" and Qwen3ASRModel is None:
+                raise HTTPException(status_code=501, detail="ASR unavailable: qwen-asr package is not installed")
+
+            model_status.update({"state": "loading", "kind": kind, "model_id": model_id, "device": model_device})
+            self._unload_model_locked()
+
+            try:
+                if kind == "asr":
+                    self._model = Qwen3ASRModel.from_pretrained(
+                        model_id,
+                        device_map=model_device,
+                        dtype=self._torch_dtype(model_device),
+                        attn_implementation=self.cpu_attn_impl if model_device == "cpu" else self.attn_impl,
+                        local_files_only=self.local_files_only,
+                        max_inference_batch_size=self.asr_max_inference_batch_size,
+                        max_new_tokens=self.asr_max_new_tokens,
+                    )
+                else:
                     self._model = Qwen3TTSModel.from_pretrained(
                         model_id,
                         device_map=model_device,
@@ -296,54 +531,73 @@ class QwenService:
                         local_files_only=self.local_files_only,
                     )
                     self._apply_post_load_device_policy(self._model, model_device)
-                except Exception as e:
-                    # A failed load can leave a partially constructed model and
-                    # CUDA cache allocations behind. Release both before replying.
-                    self._unload_model_locked()
-                    if model_device.startswith("cuda") and is_cuda_out_of_memory(e):
-                        print(json.dumps({
-                            "event": "tts_model_load_gpu_busy",
-                            "model_id": model_id,
-                            "device": model_device,
-                            "detail": str(e),
-                            "cuda": cuda_memory_snapshot(),
-                        }), flush=True)
-                        raise gpu_busy_error() from None
-                    raise
-
-                self._model_id = model_id
-                self._model_device = model_device
-                model_status.update({"state": "ready", "model_id": model_id, "device": model_device})
-                return self._model
-        except Exception:
-            model_status.update({"state": "idle", "model_id": None, "device": None})
-            raise
-        finally:
-            self.load_lock.release()
-
-    def unload_model(self) -> None:
-        """Drop the loaded model and release its CUDA allocations.
-
-        Wait for an in-flight chunk to finish before removing the service's
-        final model reference. TTS endpoints call this once their complete
-        request (including all chunks) has finished.
-        """
-        with self.generation_lock:
-            with self.lock:
-                unloaded_model_id = self._model_id
-                had_model = self._model is not None
+            except Exception as e:
+                # A failed load can leave a partially constructed model and
+                # CUDA cache allocations behind. Release both before replying.
                 self._unload_model_locked()
-                model_status.update({"state": "idle", "model_id": None, "device": None})
+                model_status.update({"state": "idle", "kind": None, "model_id": None, "device": None})
+                if model_device.startswith("cuda") and is_cuda_out_of_memory(e):
+                    print(json.dumps({
+                        "event": f"{kind}_model_load_gpu_busy",
+                        "model_id": model_id,
+                        "device": model_device,
+                        "detail": str(e),
+                        "cuda": cuda_memory_snapshot(),
+                    }), flush=True)
+                    raise gpu_busy_error() from None
+                raise
+
+            self._model_kind = kind
+            self._model_id = model_id
+            self._model_device = model_device
+            model_status.update({"state": "ready", "kind": kind, "model_id": model_id, "device": model_device})
+            return self._model
+
+    def unload_model(self, reason: str = "manual") -> None:
+        """Drop the loaded model and release its CUDA allocations."""
+        with self.request_lock:
+            with self.generation_lock:
+                with self.lock:
+                    self._cancel_idle_unload_locked()
+                    unloaded_model_id = self._model_id
+                    had_model = self._model is not None
+                    self._unload_model_locked()
+                    model_status.update({"state": "idle", "kind": None, "model_id": None, "device": None})
 
         if had_model:
             print(json.dumps({
                 "event": "tts_model_unloaded",
+                "reason": reason,
                 "model_id": unloaded_model_id,
                 "cuda": cuda_memory_snapshot(),
             }), flush=True)
 
+    def _get_cached_speaker_embedding(self, key: tuple) -> Optional[torch.Tensor]:
+        if self.speaker_cache_max_items <= 0:
+            return None
+        with self._speaker_cache_lock:
+            emb = self._speaker_cache.get(key)
+            if emb is None:
+                return None
+            self._speaker_cache.move_to_end(key)
+            return emb.clone()
+
+    def _put_cached_speaker_embedding(self, key: tuple, emb: torch.Tensor) -> None:
+        if self.speaker_cache_max_items <= 0:
+            return
+        with self._speaker_cache_lock:
+            self._speaker_cache[key] = emb.detach().cpu().clone()
+            self._speaker_cache.move_to_end(key)
+            while len(self._speaker_cache) > self.speaker_cache_max_items:
+                self._speaker_cache.popitem(last=False)
+
+    def clear_speaker_embedding_cache(self) -> None:
+        with self._speaker_cache_lock:
+            self._speaker_cache.clear()
+
     def hard_reset(self):
-        self.unload_model()
+        self.clear_speaker_embedding_cache()
+        self.unload_model(reason="reset")
 
     def resolve_reference_audio(self, filename: str, user_dir: Path) -> Path:
         candidate = (user_dir / filename).resolve()
@@ -353,43 +607,25 @@ class QwenService:
             raise HTTPException(status_code=404, detail=f"Reference audio not found: {filename}")
         return candidate
 
-    def _resolve_model_size(self, mode: str, requested_size: str, cpu_mode: bool = False) -> str:
-        size = (requested_size or "quality").strip().lower()
-        if size not in {"fast", "quality", "auto"}:
-            size = "quality"
+    def validate_request(self, req: TTSRequest, user_dir: Path) -> None:
+        """Validate request fields before waiting for the GPU lock."""
+        mode = (req.mode or "clone").strip().lower()
+        if mode == "clone":
+            if not req.reference_audio:
+                raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
+            self.resolve_reference_audio(req.reference_audio, user_dir)
+        elif mode == "design":
+            if not req.voice_description:
+                raise HTTPException(status_code=400, detail="voice_description required for design mode")
+        else:
+            raise HTTPException(status_code=400, detail="mode must be clone or design")
 
-        if size == "auto":
-            threshold_bytes = self.auto_quality_min_vram_mb * 1024 * 1024
-            free_vram_bytes = 0
-            total_vram_bytes = 0
-
-            if not cpu_mode and torch.cuda.is_available():
-                try:
-                    free_vram_bytes, total_vram_bytes = torch.cuda.mem_get_info()
-                except Exception:
-                    free_vram_bytes = 0
-                    total_vram_bytes = 0
-
-            # CUDA availability is irrelevant to a CPU-only request. Prefer
-            # the smaller model there (design is normalized to quality below).
-            selected_size = "fast" if cpu_mode else ("quality" if free_vram_bytes >= threshold_bytes else "fast")
-            print(
-                json.dumps(
-                    {
-                        "event": "tts_model_size_auto",
-                        "mode": mode,
-                        "requested": "auto",
-                        "selected": selected_size,
-                        "free_vram_mb": int(free_vram_bytes / (1024 * 1024)),
-                        "total_vram_mb": int(total_vram_bytes / (1024 * 1024)),
-                        "threshold_mb": self.auto_quality_min_vram_mb,
-                    }
-                )
-            )
-            size = selected_size
+    def _resolve_model_size(self, mode: str, requested_size: Optional[str]) -> str:
+        size = (requested_size or "fast").strip().lower()
+        if size not in {"fast", "quality"}:
+            size = "fast"
 
         if mode == "design" and size == "fast":
-            print(json.dumps({"event": "tts_warn", "detail": "design mode does not support fast; using quality"}))
             size = "quality"
 
         return size
@@ -409,7 +645,7 @@ class QwenService:
         Upstream qwen-tts currently runs the speech tokenizer on the reference
         audio even when x_vector_only_mode=True, then discards those ref codes.
         For our clone mode we only use the speaker embedding, so skip that
-        extra encode path.
+        extra encode path and cache extracted embeddings by model and file stat.
         """
         mode = (req.mode or "clone").strip().lower()
         if mode != "clone":
@@ -417,11 +653,42 @@ class QwenService:
         if not req.reference_audio:
             raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
 
-        size = self._resolve_model_size(mode, req.model_size or "quality", req.cpu_mode)
+        size = self._resolve_model_size(mode, req.model_size)
         if size not in MODEL_IDS[mode]:
-            size = "quality"
-        model = self.get_model(MODEL_IDS[mode][size], req.cpu_mode)
+            size = "fast"
+        model_id = MODEL_IDS[mode][size]
+        model = self.get_model(model_id, req.cpu_mode)
         ref_path = self.resolve_reference_audio(req.reference_audio, user_dir)
+
+        speaker_encoder = model.model.speaker_encoder
+        if speaker_encoder is None:
+            raise HTTPException(
+                status_code=500,
+                detail="failed to create voice clone prompt: loaded model has no speaker_encoder",
+            )
+        try:
+            spk_param = next(speaker_encoder.parameters())
+            spk_device = spk_param.device
+            spk_dtype = spk_param.dtype
+        except StopIteration:
+            spk_device = torch.device("cpu")
+            spk_dtype = torch.float32
+
+        try:
+            ref_stat = ref_path.stat()
+            cache_key = (model_id, str(ref_path), ref_stat.st_mtime_ns, ref_stat.st_size, str(spk_dtype))
+        except OSError:
+            cache_key = None
+
+        if cache_key is not None:
+            cached_emb = self._get_cached_speaker_embedding(cache_key)
+            if cached_emb is not None:
+                return {
+                    "ref_code": [None],
+                    "ref_spk_embedding": [cached_emb],
+                    "x_vector_only_mode": [True],
+                    "icl_mode": [False],
+                }
 
         with self.generation_lock:
             try:
@@ -439,17 +706,6 @@ class QwenService:
                     )
                 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 
-                speaker_encoder = model.model.speaker_encoder
-                if speaker_encoder is None:
-                    raise RuntimeError("loaded model has no speaker_encoder")
-                try:
-                    spk_param = next(speaker_encoder.parameters())
-                    spk_device = spk_param.device
-                    spk_dtype = spk_param.dtype
-                except StopIteration:
-                    spk_device = torch.device("cpu")
-                    spk_dtype = torch.float32
-
                 mels = mel_spectrogram(
                     torch.from_numpy(wav_resample.astype(np.float32)).unsqueeze(0),
                     n_fft=1024,
@@ -462,7 +718,8 @@ class QwenService:
                 ).transpose(1, 2)
                 with torch.inference_mode():
                     spk_emb = speaker_encoder(mels.to(spk_device).to(spk_dtype))[0].detach().cpu()
-                cleanup_generation_memory()
+                if cache_key is not None:
+                    self._put_cached_speaker_embedding(cache_key, spk_emb)
                 return {
                     "ref_code": [None],
                     "ref_spk_embedding": [spk_emb],
@@ -485,7 +742,7 @@ class QwenService:
         if not req.voice_description:
             raise HTTPException(status_code=400, detail="voice_description required for design mode")
 
-        size = self._resolve_model_size(mode, req.model_size or "quality", req.cpu_mode)
+        size = self._resolve_model_size(mode, req.model_size)
         if size not in MODEL_IDS[mode]:
             size = "quality"
         self.get_model(MODEL_IDS[mode][size], req.cpu_mode)
@@ -532,6 +789,49 @@ class QwenService:
             _frame_sink.fn = None
             tokenizer.__dict__.pop("decode", None)
 
+    def _resolve_asr_model_size(self, requested_size: Optional[str]) -> str:
+        size = (requested_size or "fast").strip().lower()
+        if size not in ASR_MODEL_IDS:
+            return "fast"
+        return size
+
+    def transcribe(
+        self,
+        wav: np.ndarray,
+        sample_rate: int,
+        model_size: Optional[str] = "fast",
+        language: Optional[str] = None,
+        context: str = "",
+        cpu_mode: bool = False,
+    ) -> tuple[str, str, str, str]:
+        """Transcribe a mono float32 audio array using Qwen3-ASR."""
+        size = self._resolve_asr_model_size(model_size)
+        model_id = ASR_MODEL_IDS[size]
+        model = self.get_model(model_id, cpu_mode=cpu_mode, kind="asr")
+        print(json.dumps({
+            "event": "asr_transcribe_start",
+            "model_id": model_id,
+            "model_size": size,
+            "duration_s": round(float(wav.size) / float(sample_rate), 3),
+            "language": language or "Auto",
+            "cuda": cuda_memory_snapshot(),
+        }), flush=True)
+        try:
+            with self.generation_lock:
+                results = model.transcribe(
+                    audio=(wav, sample_rate),
+                    context=context or "",
+                    language=language,
+                )
+        except Exception as e:
+            self._raise_gpu_busy_if_oom(e)
+            raise
+
+        if not results:
+            return "", language or "", model_id, size
+        first = results[0]
+        return (getattr(first, "text", "") or "").strip(), (getattr(first, "language", "") or ""), model_id, size
+
     def synthesize(self, req: TTSRequest, user_dir: Path, extra_kwargs: Optional[dict] = None, on_frame=None):
         """Generate one text chunk.
 
@@ -553,10 +853,9 @@ class QwenService:
         if mode not in MODEL_IDS:
             raise HTTPException(status_code=400, detail="mode must be clone or design")
 
-        size = self._resolve_model_size(mode, req.model_size or "quality", req.cpu_mode)
-
+        size = self._resolve_model_size(mode, req.model_size)
         if size not in MODEL_IDS[mode]:
-            size = "quality"
+            size = "quality" if mode == "design" else "fast"
 
         model_id = MODEL_IDS[mode][size]
 
@@ -806,7 +1105,7 @@ class StreamingCodecDecoder:
         if prev is None:
             prev = x.new_zeros(x.shape[0], x.shape[1], m.padding)
         x = torch.cat([prev, x], dim=-1)
-        self.state[id(m)] = x[..., x.shape[-1] - m.padding:]
+        self.state[id(m)] = x[..., x.shape[-1] - m.padding:].clone()
         return m.conv(x)
 
     def _causal_trans_conv(self, m, x: torch.Tensor) -> torch.Tensor:
@@ -1099,25 +1398,7 @@ def _idle_cuda_release_loop() -> None:
     while True:
         time.sleep(IDLE_CUDA_RELEASE_SECONDS)
         try:
-            if svc.loaded_model() is not None:
-                continue
-            if torch.cuda.memory_reserved() < IDLE_CUDA_RELEASE_MIN_MB * 1024 * 1024:
-                continue
-            # Skip while a model load is in progress; it will manage memory itself.
-            if not svc.load_lock.acquire(blocking=False):
-                continue
-            try:
-                if svc.loaded_model() is not None:
-                    continue
-                before_mb = int(torch.cuda.memory_reserved() / (1024 * 1024))
-                cleanup_generation_memory()
-            finally:
-                svc.load_lock.release()
-            print(json.dumps({
-                "event": "tts_idle_cuda_released",
-                "reserved_before_mb": before_mb,
-                "cuda": cuda_memory_snapshot(),
-            }), flush=True)
+            svc.release_idle_cuda_memory(IDLE_CUDA_RELEASE_MIN_MB)
         except Exception as e:
             print(json.dumps({"event": "tts_idle_cuda_release_error", "detail": str(e)}), flush=True)
 
@@ -1138,10 +1419,125 @@ def healthz():
     return {"ok": True, "uptime_s": int(time.time() - start_time)}
 
 
+def normalize_asr_language(language: Optional[str]) -> Optional[str]:
+    raw = (language or "").strip()
+    if not raw or raw.lower() == "auto":
+        return None
+    lowered = raw.lower()
+    if lowered in _ASR_LANGUAGE_BY_LOWER:
+        return _ASR_LANGUAGE_BY_LOWER[lowered]
+    if lowered in ASR_LANGUAGE_ALIASES:
+        return ASR_LANGUAGE_ALIASES[lowered]
+    primary = re.split(r"[-_]", lowered, maxsplit=1)[0]
+    if primary in ASR_LANGUAGE_ALIASES:
+        return ASR_LANGUAGE_ALIASES[primary]
+    raise HTTPException(status_code=400, detail=f"Unsupported ASR language: {raw}")
+
+
+def _resolve_openai_asr_model_size(model: Optional[str]) -> str:
+    raw = (model or "").strip().lower()
+    if not raw:
+        return "fast"
+    if raw in ASR_MODEL_IDS:
+        return raw
+    if raw == ASR_MODEL_IDS["quality"].lower() or "1.7b" in raw:
+        return "quality"
+    if raw == ASR_MODEL_IDS["fast"].lower() or "0.6b" in raw:
+        return "fast"
+    return "fast"
+
+
+def read_uploaded_asr_bytes(file: UploadFile) -> bytes:
+    max_bytes = ASR_MAX_UPLOAD_MB * 1024 * 1024
+    data = file.file.read(max_bytes + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"Uploaded audio exceeds {ASR_MAX_UPLOAD_MB} MB limit")
+    return data
+
+
+def _decode_asr_audio_ffmpeg(data: bytes, filename: str = "") -> np.ndarray:
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+        suffix = ".audio"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        try:
+            proc = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-i", tmp.name,
+                    "-vn",
+                    "-ac", "1",
+                    "-ar", str(ASR_SAMPLE_RATE),
+                    "-f", "f32le",
+                    "pipe:1",
+                ],
+                capture_output=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=500,
+                detail="ffmpeg is required to decode this audio format",
+            )
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to decode audio{f': {err}' if err else ''}",
+        )
+    return np.frombuffer(proc.stdout, dtype="<f4").copy()
+
+
+def decode_asr_audio(data: bytes, filename: str = "") -> tuple[np.ndarray, int]:
+    """Decode uploaded audio bytes to 16 kHz mono float32 PCM."""
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+
+    wav: Optional[np.ndarray] = None
+    sf_decoded = None
+    try:
+        raw, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+        mono = raw.mean(axis=1) if raw.shape[1] > 1 else raw[:, 0]
+        if int(sr) == ASR_SAMPLE_RATE:
+            wav = np.asarray(mono, dtype=np.float32)
+        else:
+            sf_decoded = (np.asarray(mono, dtype=np.float32), int(sr))
+    except Exception:
+        sf_decoded = None
+
+    if wav is None:
+        try:
+            wav = _decode_asr_audio_ffmpeg(data, filename)
+        except HTTPException as exc:
+            if exc.status_code == 500 and sf_decoded is not None:
+                import librosa
+
+                mono, sr = sf_decoded
+                wav = np.asarray(
+                    librosa.resample(y=mono, orig_sr=sr, target_sr=ASR_SAMPLE_RATE),
+                    dtype=np.float32,
+                )
+            else:
+                raise
+
+    wav = np.nan_to_num(wav, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    if wav.size == 0:
+        raise HTTPException(status_code=400, detail="Decoded audio is empty")
+    return wav, ASR_SAMPLE_RATE
+
+
 @app.get("/status")
 def status():
     return {
         "model_state": model_status["state"],
+        "model_kind": model_status["kind"],
         "model_id": model_status["model_id"],
         "device": model_status["device"],
         "uptime_s": int(time.time() - start_time),
@@ -1152,7 +1548,12 @@ def status():
 @app.get("/readyz")
 def readyz():
     if model_status["state"] == "ready":
-        return {"ready": True, "model_id": model_status["model_id"], "device": model_status["device"]}
+        return {
+            "ready": True,
+            "model_kind": model_status["kind"],
+            "model_id": model_status["model_id"],
+            "device": model_status["device"],
+        }
     return JSONResponse(
         status_code=503,
         content={"ready": False, "reason": model_status["state"]},
@@ -1164,10 +1565,20 @@ def info():
     return {
         "models": MODEL_IDS,
         "modes": ["clone", "design"],
-        "sizes": ["fast", "quality", "auto"],
+        "sizes": ["fast", "quality"],
         "current_model": svc._model_id,
+        "current_model_kind": svc._model_kind,
         "current_device": svc._model_device,
         "supported_languages": SUPPORTED_LANGUAGES,
+        "asr": {
+            "available": Qwen3ASRModel is not None,
+            "models": ASR_MODEL_IDS,
+            "sizes": ["fast", "quality"],
+            "supported_languages": ASR_SUPPORTED_LANGUAGES,
+            "max_new_tokens": svc.asr_max_new_tokens,
+            "max_inference_batch_size": svc.asr_max_inference_batch_size,
+            "max_upload_mb": ASR_MAX_UPLOAD_MB,
+        },
         "generation": {
             "max_chunk_chars": MAX_CHUNK_CHARS,
             "stream_first_frames": STREAM_FIRST_FRAMES,
@@ -1179,6 +1590,8 @@ def info():
             "max_new_tokens_per_char": svc.max_new_tokens_per_char,
             "max_new_tokens_buffer": svc.max_new_tokens_buffer,
             "non_streaming_mode": svc.non_streaming_mode,
+            "idle_unload_seconds": svc.idle_unload_seconds,
+            "speaker_embedding_cache_max_items": svc.speaker_cache_max_items,
             "default_device": svc.device,
             "cpu_mode_supported": True,
             "cpu_dtype": svc.cpu_dtype,
@@ -1336,21 +1749,23 @@ def tts_audio_stream(req: TTSRequest):
     audio_format = req.audio_format.lower().strip()
     if audio_format not in {"wav", "pcm"}:
         raise HTTPException(status_code=400, detail="audio_format must be wav or pcm for audio-stream endpoint")
+    if not QWEN_MEMORY_PATCH_ENABLED:
+        raise HTTPException(status_code=501, detail="frame streaming unavailable: talker patch not active")
+    svc.validate_request(req, user_dir)
 
     chunks = chunk_text(req.text)
     n_chunks = len(chunks)
     t0 = time.time()
+    session = svc.begin_request()
     try:
         base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
         model = svc.loaded_model()
         speech_tokenizer = model.model.speech_tokenizer
-        if not QWEN_MEMORY_PATCH_ENABLED:
-            raise HTTPException(status_code=501, detail="frame streaming unavailable: talker patch not active")
         if speech_tokenizer.get_model_type() != "qwen3_tts_tokenizer_12hz":
             raise HTTPException(status_code=501, detail="frame streaming requires a 12Hz model")
         sample_rate = int(speech_tokenizer.get_output_sample_rate())
     except Exception:
-        svc.unload_model()
+        session.finish(unload_now=True)
         raise
 
     events: queue.Queue = queue.Queue()
@@ -1373,14 +1788,11 @@ def tts_audio_stream(req: TTSRequest):
                     extra_kwargs={**base_extra_kwargs, "non_streaming_mode": False},
                     on_frame=on_frame,
                 )
-                cleanup_generation_memory()
                 events.put(("chunk_end", i))
             events.put(("done", None))
         except StreamCancelled:
-            cleanup_generation_memory()
             events.put(("done", None))
         except Exception as e:
-            cleanup_generation_memory()
             events.put(("error", e))
 
     stats = {"frames": 0, "samples": 0, "t_first_audio_ms": None}
@@ -1437,7 +1849,8 @@ def tts_audio_stream(req: TTSRequest):
                 stats["samples"] += int(piece.size)
                 yield float_wav_to_pcm16_bytes(piece)
 
-    threading.Thread(target=run_generation, daemon=True).start()
+    gen_thread = threading.Thread(target=run_generation, daemon=True)
+    gen_thread.start()
     payloads = pcm_payloads()
 
     # Wait for the first audio before sending headers, so a failure (GPU
@@ -1446,16 +1859,20 @@ def tts_audio_stream(req: TTSRequest):
         first = next(payloads, b"")
     except Exception as e:
         cancel.set()
+        gen_thread.join()
+        payloads.close()
         print(json.dumps({
             "event": "tts_audio_stream_first_audio_error",
             "detail": str(getattr(e, "detail", e)),
             "chunks": n_chunks,
             "cuda": cuda_memory_snapshot(),
         }), flush=True)
-        svc.unload_model()
+        session.finish(unload_now=True)
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(status_code=500, detail=f"tts audio stream failed before first audio: {e}")
+
+    stream_error = [False]
 
     def body():
         try:
@@ -1475,6 +1892,7 @@ def tts_audio_stream(req: TTSRequest):
                 "cuda": cuda_memory_snapshot(),
             }), flush=True)
         except Exception as e:
+            stream_error[0] = True
             print(json.dumps({
                 "event": "tts_audio_stream_error",
                 "detail": str(getattr(e, "detail", e)),
@@ -1482,15 +1900,18 @@ def tts_audio_stream(req: TTSRequest):
                 "cuda": cuda_memory_snapshot(),
             }), flush=True)
             raise
-        finally:
-            # Normal end, error, or client disconnect: stop generation at the
-            # next frame, then release the model. unload_model() waits on
-            # generation_lock, so the worker has left generate() by then.
-            cancel.set()
-            svc.unload_model()
+
+    def close_stream() -> None:
+        # Stop generation at the next frame, wait for the worker to exit
+        # generate(), drop decoder tensors, then flush CUDA cache and hand off
+        # to the idle-unload timer (or unload immediately after an error).
+        cancel.set()
+        gen_thread.join()
+        payloads.close()
+        session.finish(unload_now=stream_error[0])
 
     return StreamingResponse(
-        body(),
+        _ManagedStream(body(), close_stream),
         media_type="audio/wav" if audio_format == "wav" else "audio/pcm",
         headers={
             "Cache-Control": "no-cache",
@@ -1510,18 +1931,21 @@ def tts_stream(req: TTSRequest):
     audio_format = req.audio_format.lower().strip()
     if audio_format != "wav":
         raise HTTPException(status_code=400, detail="audio_format must be wav for stream endpoint")
+    svc.validate_request(req, user_dir)
 
     chunks = chunk_text(req.text)
     n_chunks = len(chunks)
+    session = svc.begin_request()
     try:
         base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
     except Exception:
-        svc.unload_model()
+        session.finish(unload_now=True)
         raise
 
     q: queue.Queue = queue.Queue()
 
     def run_generation():
+        unload_now = False
         try:
             wav_arrays: list[np.ndarray] = []
             sr_final = 24000
@@ -1565,7 +1989,6 @@ def tts_stream(req: TTSRequest):
                 wav = postprocess_chunk_audio(wav, int(sr))
                 wav_arrays.append(np.asarray(wav, dtype=np.float32))
                 del wav
-                cleanup_generation_memory()
                 sr_final = sr
                 total_tokens += chunk_token_count[0]
 
@@ -1585,13 +2008,14 @@ def tts_stream(req: TTSRequest):
                 "tokens_generated": total_tokens,
             }))
         except Exception as e:
+            unload_now = True
             detail = e.detail if isinstance(e, HTTPException) else str(e)
             payload = {"detail": detail}
             if isinstance(e, HTTPException):
                 payload["status_code"] = e.status_code
             q.put(("error", payload))
         finally:
-            svc.unload_model()
+            session.finish(unload_now=unload_now)
 
     threading.Thread(target=run_generation, daemon=True).start()
 
@@ -1620,18 +2044,19 @@ def tts(req: TTSRequest):
     audio_format = req.audio_format.lower().strip()
     if audio_format not in {"wav", "ogg"}:
         raise HTTPException(status_code=400, detail="audio_format must be wav or ogg")
+    svc.validate_request(req, user_dir)
 
     chunks = chunk_text(req.text)
     n_chunks = len(chunks)
-    try:
+    wav_arrays: list[np.ndarray] = []
+    sr_final: int = 24000
+    used_model_id: str = ""
+    used_size: str = ""
+
+    with svc.request_session():
         base_extra_kwargs = svc.prepare_request_extra_kwargs(req, user_dir)
 
         t1 = time.time()
-        wav_arrays: list[np.ndarray] = []
-        sr_final: int = 24000
-        used_model_id: str = ""
-        used_size: str = ""
-
         for i, chunk in enumerate(chunks):
             chunk_req = req.model_copy(update={"text": chunk})
             wav, sr, used_model_id, used_size = svc.synthesize(
@@ -1640,46 +2065,148 @@ def tts(req: TTSRequest):
             wav = postprocess_chunk_audio(wav, int(sr))
             wav_arrays.append(np.asarray(wav, dtype=np.float32))
             del wav
-            cleanup_generation_memory()
             sr_final = sr
             if n_chunks > 1:
                 print(json.dumps({"event": "tts_chunk", "chunk": i + 1, "of": n_chunks, "chars": len(chunk)}))
 
-        data = np.concatenate(wav_arrays) if len(wav_arrays) > 1 else wav_arrays[0]
+    data = np.concatenate(wav_arrays) if len(wav_arrays) > 1 else wav_arrays[0]
+    t2 = time.time()
+
+    buf = io.BytesIO()
+    if audio_format == "wav":
+        sf.write(buf, data, sr_final, format="WAV")
+        mime = "audio/wav"
+    else:
+        sf.write(buf, data, sr_final, format="OGG", subtype="VORBIS")
+        mime = "audio/ogg"
+    t3 = time.time()
+
+    total = t3 - t0
+    t_synth = t2 - t1
+    t_encode = t3 - t2
+
+    try:
+        print(
+            json.dumps(
+                {
+                    "event": "tts_timing",
+                    "mode": req.mode,
+                    "model_size": used_size,
+                    "chars": len(req.text or ""),
+                    "chunks": n_chunks,
+                    "model_id": used_model_id,
+                    "t_total_ms": int(total * 1000),
+                    "t_synth_ms": int(t_synth * 1000),
+                    "t_encode_ms": int(t_encode * 1000),
+                }
+            )
+        )
+    except Exception:
+        pass
+
+    return Response(content=buf.getvalue(), media_type=mime)
+
+
+def _run_asr_request(
+    file: UploadFile,
+    model_size: Optional[str],
+    language: Optional[str],
+    context: str,
+    cpu_mode: bool,
+) -> dict:
+    if Qwen3ASRModel is None:
+        raise HTTPException(status_code=501, detail="ASR unavailable: qwen-asr package is not installed")
+    t0 = time.time()
+    normalized_language = normalize_asr_language(language)
+    data = read_uploaded_asr_bytes(file)
+    wav, sr = decode_asr_audio(data, file.filename or "")
+    duration_s = round(float(wav.size) / float(sr), 3)
+
+    with svc.request_session():
+        t1 = time.time()
+        text, detected_language, used_model_id, used_size = svc.transcribe(
+            wav=wav,
+            sample_rate=sr,
+            model_size=model_size,
+            language=normalized_language,
+            context=context,
+            cpu_mode=cpu_mode,
+        )
         t2 = time.time()
 
-        buf = io.BytesIO()
-        if audio_format == "wav":
-            sf.write(buf, data, sr_final, format="WAV")
-            mime = "audio/wav"
-        else:
-            sf.write(buf, data, sr_final, format="OGG", subtype="VORBIS")
-            mime = "audio/ogg"
-        t3 = time.time()
+    total_ms = int((t2 - t0) * 1000)
+    transcribe_ms = int((t2 - t1) * 1000)
+    print(json.dumps({
+        "event": "asr_timing",
+        "model_size": used_size,
+        "model_id": used_model_id,
+        "language": detected_language or normalized_language or "Auto",
+        "duration_s": duration_s,
+        "chars": len(text),
+        "t_total_ms": total_ms,
+        "t_transcribe_ms": transcribe_ms,
+    }), flush=True)
 
-        total = t3 - t0
-        t_synth = t2 - t1
-        t_encode = t3 - t2
+    return {
+        "text": text,
+        "language": detected_language or normalized_language or "",
+        "model_id": used_model_id,
+        "model_size": used_size,
+        "duration_s": duration_s,
+        "t_total_ms": total_ms,
+        "t_transcribe_ms": transcribe_ms,
+    }
 
-        try:
-            print(
-                json.dumps(
-                    {
-                        "event": "tts_timing",
-                        "mode": req.mode,
-                        "model_size": used_size,
-                        "chars": len(req.text or ""),
-                        "chunks": n_chunks,
-                        "model_id": used_model_id,
-                        "t_total_ms": int(total * 1000),
-                        "t_synth_ms": int(t_synth * 1000),
-                        "t_encode_ms": int(t_encode * 1000),
-                    }
-                )
-            )
-        except Exception:
-            pass
 
-        return Response(content=buf.getvalue(), media_type=mime)
-    finally:
-        svc.unload_model()
+@app.post("/api/asr")
+def asr(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(default=None),
+    model_size: str = Form(default="fast"),
+    context: str = Form(default=""),
+    cpu_mode: bool = Form(default=False),
+):
+    """Transcribe an uploaded audio file with Qwen3-ASR."""
+    return _run_asr_request(
+        file=file,
+        model_size=model_size,
+        language=language,
+        context=context,
+        cpu_mode=cpu_mode,
+    )
+
+
+@app.post("/v1/audio/transcriptions")
+def openai_audio_transcriptions(
+    file: UploadFile = File(...),
+    model: Optional[str] = Form(default=None),
+    language: Optional[str] = Form(default=None),
+    prompt: Optional[str] = Form(default=None),
+    response_format: str = Form(default="json"),
+    cpu_mode: bool = Form(default=False),
+):
+    """OpenAI Whisper-compatible transcription endpoint backed by Qwen3-ASR."""
+    fmt = (response_format or "json").strip().lower()
+    if fmt not in {"json", "text", "verbose_json"}:
+        raise HTTPException(
+            status_code=400,
+            detail="response_format must be json, text, or verbose_json",
+        )
+    result = _run_asr_request(
+        file=file,
+        model_size=_resolve_openai_asr_model_size(model),
+        language=language,
+        context=prompt or "",
+        cpu_mode=cpu_mode,
+    )
+    if fmt == "text":
+        return Response(content=result["text"], media_type="text/plain; charset=utf-8")
+    if fmt == "verbose_json":
+        return {
+            "task": "transcribe",
+            "language": result["language"],
+            "duration": result["duration_s"],
+            "text": result["text"],
+            "model": result["model_id"],
+        }
+    return {"text": result["text"]}

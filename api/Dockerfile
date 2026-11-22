@@ -28,7 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install --upgrade pip setuptools wheel && \
-    python3 -m pip install -r /app/requirements.txt
+    python3 -m pip install -r /app/requirements.txt && \
+    python3 -m pip install --no-deps qwen-tts==0.1.1
 
 COPY app /app/app
 

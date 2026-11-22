@@ -1,7 +1,8 @@
 # Sonar
 
-Self-hosted text-to-speech built on [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS): an HTTP API
-that synthesizes, streams, clones and designs voices on a GPU, and a small web UI for it.
+Self-hosted speech API built on [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) and
+[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR): an HTTP API that synthesizes, streams, clones,
+designs voices, and transcribes speech on a GPU, plus a small web UI for TTS.
 
 ```
 browser ──> ui (nginx, static Svelte build) ──/tts-api──> api (FastAPI + Qwen3-TTS, GPU)
@@ -23,7 +24,7 @@ There is no authentication. Keep it on a private network.
 
 ```sh
 # API (needs an NVIDIA GPU and the models in the Hugging Face cache; see api/README.md)
-cd api && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+cd api && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt && pip install --no-deps qwen-tts==0.1.1
 python3 -m uvicorn app.main:app --port 8888
 
 # UI, proxying to the API on localhost:8888

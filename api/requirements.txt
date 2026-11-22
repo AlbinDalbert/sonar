@@ -2,7 +2,13 @@
 
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
-qwen-tts==0.1.1
+# qwen-asr==0.0.6 pins transformers==4.57.6 while qwen-tts==0.1.1 pins
+# transformers==4.57.3. Install qwen-asr here and qwen-tts==0.1.1 with
+# --no-deps (plus its extra deps below); both share transformers==4.57.6.
+qwen-asr==0.0.6
+PyYAML>=6.0
+onnxruntime
+einops
 # Keep PyTorch and torchaudio versions aligned for CUDA 12.4 wheels.
 torch==2.6.0
 torchaudio==2.6.0
