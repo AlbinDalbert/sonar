@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { saveDesignedVoice, savePreset } from './api'
+  import { defaultVoiceConflict, saveDesignedVoice, savePreset, type Voices } from './api'
 
   export interface Clip {
     id: number
@@ -14,13 +14,12 @@
   interface Props {
     clip: Clip
     user: string
-    takenFiles: string[]
-    takenPresets: string[]
+    voices: Voices
     onremove: () => void
     onsaved: () => void
   }
 
-  let { clip, user, takenFiles, takenPresets, onremove, onsaved }: Props = $props()
+  let { clip, user, voices, onremove, onsaved }: Props = $props()
 
   let name = $state('')
   let error = $state('')
@@ -52,13 +51,17 @@
 
   function saveClone() {
     if (name.includes('/')) return void (error = "Names can't contain /")
-    if (takenFiles.includes(filename)) return void (error = `${filename} already exists`)
+    const conflict = defaultVoiceConflict(user, filename, voices, true)
+    if (conflict) return void (error = `${filename} conflicts with default voice ${conflict}`)
+    if (voices.files.some((file) => file.filename === filename)) return void (error = `${filename} already exists`)
     return save(() => saveDesignedVoice(user, filename, clip.design ?? '', clip.audio), filename)
   }
 
   function savePresetFromClip() {
     const presetName = name.trim()
-    if (takenPresets.includes(presetName)) return void (error = `${presetName} already exists`)
+    const conflict = defaultVoiceConflict(user, presetName, voices, false)
+    if (conflict) return void (error = `${presetName} conflicts with default voice ${conflict}`)
+    if (voices.presets.some((preset) => preset.name === presetName)) return void (error = `${presetName} already exists`)
     return save(() => savePreset(user, { name: presetName, voice_description: clip.design ?? '' }), presetName)
   }
 </script>

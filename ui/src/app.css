@@ -156,6 +156,7 @@ button.pick {
 button.pick::before, button.pick::after { content: none; }
 button.pick:hover:not(:disabled) { color: var(--accent-strong); }
 .desc { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tag { font-size: 11px; padding: 0 4px; white-space: nowrap; }
 
 /* Bigger targets on touch, and 16px stops iPhones zooming into focused fields. */
 @media (pointer: coarse) {

@@ -187,7 +187,7 @@ Returns the model IDs, modes, sizes, loaded model, supported languages and gener
 - `POST /voice-presets` → create/update preset
 - `DELETE /voice-presets/{name}` → delete preset
 
-Presets are stored per user (`?user=name`, default `default`) in `/reference-audio/<user>/voice_presets.json`. None are built in.
+Presets and reference audio are stored per user (`?user=name`, default `default`) in `/reference-audio/<user>/`. None are built in. Voices in `default` are available to all users; non-default users can only add their own voices and cannot reuse, edit, or delete default voice names.
 
 ## Voice cloning behavior
 

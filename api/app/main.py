@@ -79,6 +79,7 @@ ASR_LANGUAGE_ALIASES = {
 ASR_SAMPLE_RATE = 16000
 ASR_MAX_UPLOAD_MB = max(1, int(os.getenv("QWEN_ASR_MAX_UPLOAD_MB", "100")))
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
+DEFAULT_USER = "default"
 VOICE_PRESETS_FILENAME = "voice_presets.json"
 MODEL_IDS = {
     "clone": {
@@ -650,10 +651,15 @@ class QwenService:
         self.unload_model(reason="reset")
 
     def resolve_reference_audio(self, filename: str, user_dir: Path) -> Path:
-        safe_name, candidate = _resolve_reference_path(filename, user_dir)
-        if not candidate.is_file():
-            raise HTTPException(status_code=404, detail=f"Reference audio not found: {safe_name}")
-        return candidate
+        default_dir = user_audio_dir(DEFAULT_USER, create=False)
+        safe_name, default_candidate = _resolve_reference_path(filename, default_dir)
+        if default_candidate.is_file():
+            return default_candidate
+        if user_dir.resolve() != default_dir.resolve():
+            _, candidate = _resolve_reference_path(safe_name, user_dir)
+            if candidate.is_file() and _find_default_reference_collision(safe_name) is None:
+                return candidate
+        raise HTTPException(status_code=404, detail=f"Reference audio not found: {safe_name}")
 
     def validate_request(self, req: TTSRequest, user_dir: Path) -> None:
         """Validate request fields before waiting for the GPU lock."""
@@ -1408,17 +1414,86 @@ def read_meta(directory: Path, filename: str):
 
 
 
-def user_audio_dir(user: str) -> Path:
-    candidate = (user or "default").strip()
+def normalize_user(user: Optional[str]) -> str:
+    candidate = (user or DEFAULT_USER).strip()
     if not candidate or len(candidate) > 32 or not re.fullmatch(r"[A-Za-z0-9_-]+", candidate):
-        raise HTTPException(status_code=400, detail="Invalid user. Use up to 32 chars: letters, numbers, underscore, hyphen")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid user. Use up to 32 chars: letters, numbers, underscore, hyphen",
+        )
+    return candidate
+
+
+def user_audio_dir(user: Optional[str], *, create: bool = True) -> Path:
+    candidate = normalize_user(user)
     directory = REFERENCE_AUDIO_DIR / candidate
-    directory.mkdir(parents=True, exist_ok=True)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 
-def user_presets_path(user: str) -> Path:
-    return user_audio_dir(user) / VOICE_PRESETS_FILENAME
+def user_presets_path(user: Optional[str], *, create: bool = True) -> Path:
+    return user_audio_dir(user, create=create) / VOICE_PRESETS_FILENAME
+
+
+def _list_dir_reference_audio(dir_path: Path) -> list[Path]:
+    if not dir_path.is_dir():
+        return []
+    return [
+        p for p in sorted(dir_path.iterdir())
+        if p.is_file() and not _is_internal_reference_file(p.name)
+    ]
+
+
+def _find_default_reference_collision(filename: str) -> Optional[str]:
+    safe_name = _validate_reference_filename(filename)
+    target_lower = safe_name.lower()
+    target_stem_lower = Path(safe_name).stem.lower()
+    default_dir = user_audio_dir(DEFAULT_USER, create=False)
+    for p in _list_dir_reference_audio(default_dir):
+        if p.name.lower() == target_lower or p.stem.lower() == target_stem_lower:
+            return p.name
+    return None
+
+
+def _find_default_preset_collision(name: str, default_presets: dict[str, dict]) -> Optional[str]:
+    target_lower = name.lower()
+    for existing in default_presets:
+        if existing.lower() == target_lower:
+            return existing
+    return None
+
+
+def _default_voice_collision(
+    name: str,
+    *,
+    default_presets: Optional[dict[str, dict]] = None,
+    as_filename: bool = False,
+) -> Optional[str]:
+    """Return the colliding default voice name if `name` clashes with any default clone or preset."""
+    target_lower = name.lower()
+    target_stem_lower = Path(name).stem.lower() if as_filename else target_lower
+
+    default_dir = user_audio_dir(DEFAULT_USER, create=False)
+    for p in _list_dir_reference_audio(default_dir):
+        p_name_lower = p.name.lower()
+        p_stem_lower = p.stem.lower()
+        if (
+            p_name_lower == target_lower
+            or p_stem_lower == target_lower
+            or p_stem_lower == target_stem_lower
+        ):
+            return p.name
+
+    if default_presets is None:
+        with voice_presets_lock:
+            default_presets = load_voice_presets(user_presets_path(DEFAULT_USER, create=False))
+    for preset_name in default_presets:
+        preset_lower = preset_name.lower()
+        if preset_lower == target_lower or preset_lower == target_stem_lower:
+            return preset_name
+
+    return None
 
 
 voice_presets_lock = threading.Lock()
@@ -1484,13 +1559,36 @@ def save_voice_presets(path: Path, presets: dict[str, dict]):
     _atomic_write_text(path, json.dumps(ordered, ensure_ascii=False, indent=2))
 
 
+def load_effective_voice_presets(user: Optional[str]) -> dict[str, dict]:
+    """Return merged default + user presets with `is_default` flags.
+
+    Caller must hold `voice_presets_lock`.
+    """
+    canonical_user = normalize_user(user)
+    default_presets = load_voice_presets(user_presets_path(DEFAULT_USER, create=False))
+    merged: dict[str, dict] = {}
+    default_names_lower: set[str] = set()
+    for name, preset in default_presets.items():
+        merged[name] = {**preset, "is_default": True}
+        default_names_lower.add(name.lower())
+
+    if canonical_user != DEFAULT_USER:
+        user_presets = load_voice_presets(user_presets_path(canonical_user, create=False))
+        for name, preset in user_presets.items():
+            if name.lower() in default_names_lower:
+                continue
+            merged[name] = {**preset, "is_default": False}
+
+    return merged
+
+
 def apply_voice_preset(req: TTSRequest) -> TTSRequest:
     if not req.voice_preset:
         return req
 
     preset_name = _normalize_preset_name(req.voice_preset)
     with voice_presets_lock:
-        presets = load_voice_presets(user_presets_path(req.user or "default"))
+        presets = load_effective_voice_presets(req.user)
     preset = presets.get(preset_name)
     if not preset:
         raise HTTPException(status_code=404, detail=f"voice preset not found: {preset_name}")
@@ -1749,31 +1847,57 @@ def reset(req: Optional[ResetRequest] = None):
 
 
 @app.get("/reference-audio")
-def list_reference_audio(user: str = Query(default="default")):
-    dir_path = user_audio_dir(user)
-    files = []
-    for p in sorted(dir_path.iterdir()):
-        if not p.is_file() or _is_internal_reference_file(p.name):
-            continue
-        meta = read_meta(dir_path, p.name)
-        files.append(
-            {
+def list_reference_audio(user: str = Query(default=DEFAULT_USER)):
+    canonical_user = normalize_user(user)
+    default_dir = user_audio_dir(DEFAULT_USER, create=False)
+    entries: dict[str, dict] = {}
+    default_names_lower: set[str] = set()
+    default_stems_lower: set[str] = set()
+
+    for p in _list_dir_reference_audio(default_dir):
+        meta = read_meta(default_dir, p.name)
+        entries[p.name] = {
+            "filename": p.name,
+            "source": meta.get("source", "upload"),
+            "description": meta.get("description"),
+            "is_default": True,
+        }
+        default_names_lower.add(p.name.lower())
+        default_stems_lower.add(p.stem.lower())
+
+    if canonical_user != DEFAULT_USER:
+        dir_path = user_audio_dir(canonical_user, create=False)
+        for p in _list_dir_reference_audio(dir_path):
+            if p.name.lower() in default_names_lower or p.stem.lower() in default_stems_lower:
+                continue
+            meta = read_meta(dir_path, p.name)
+            entries[p.name] = {
                 "filename": p.name,
                 "source": meta.get("source", "upload"),
                 "description": meta.get("description"),
+                "is_default": False,
             }
-        )
 
+    files = [entries[name] for name in sorted(entries)]
     return {"files": files}
 
 
 @app.post("/reference-audio/upload")
-async def upload_reference_audio(file: UploadFile = File(...), user: str = Query(default="default")):
-    dir_path = user_audio_dir(user)
+async def upload_reference_audio(file: UploadFile = File(...), user: str = Query(default=DEFAULT_USER)):
+    canonical_user = normalize_user(user)
     raw_name = (file.filename or "").strip()
     if not raw_name:
         raise HTTPException(status_code=400, detail="Missing filename")
-    filename, target = _resolve_reference_path(Path(raw_name).name, dir_path)
+    safe_name = _validate_reference_filename(Path(raw_name).name)
+    if canonical_user != DEFAULT_USER:
+        collision = _default_voice_collision(safe_name, as_filename=True)
+        if collision is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot use default voice name: {collision}",
+            )
+    dir_path = user_audio_dir(canonical_user, create=True)
+    filename, target = _resolve_reference_path(safe_name, dir_path)
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
@@ -1783,12 +1907,21 @@ async def upload_reference_audio(file: UploadFile = File(...), user: str = Query
 
 
 @app.post("/reference-audio/save-design")
-def save_design_reference_audio(req: SaveDesignRequest, user: str = Query(default="default")):
-    dir_path = user_audio_dir(user)
+def save_design_reference_audio(req: SaveDesignRequest, user: str = Query(default=DEFAULT_USER)):
+    canonical_user = normalize_user(user)
     raw_name = (req.filename or "").strip()
     if not raw_name:
         raise HTTPException(status_code=400, detail="Missing filename")
-    filename, target = _resolve_reference_path(raw_name, dir_path)
+    safe_name = _validate_reference_filename(raw_name)
+    if canonical_user != DEFAULT_USER:
+        collision = _default_voice_collision(safe_name, as_filename=True)
+        if collision is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot use default voice name: {collision}",
+            )
+    dir_path = user_audio_dir(canonical_user, create=True)
+    filename, target = _resolve_reference_path(safe_name, dir_path)
 
     audio_b64 = req.audio_b64.strip()
     if "," in audio_b64 and audio_b64.lower().startswith("data:"):
@@ -1808,9 +1941,20 @@ def save_design_reference_audio(req: SaveDesignRequest, user: str = Query(defaul
 
 
 @app.delete("/reference-audio/{filename}")
-def delete_reference_audio(filename: str, user: str = Query(default="default")):
-    dir_path = user_audio_dir(user)
-    target = svc.resolve_reference_audio(filename, dir_path)
+def delete_reference_audio(filename: str, user: str = Query(default=DEFAULT_USER)):
+    canonical_user = normalize_user(user)
+    dir_path = user_audio_dir(canonical_user, create=False)
+    safe_name, target = _resolve_reference_path(filename, dir_path)
+    if canonical_user != DEFAULT_USER:
+        default_dir = user_audio_dir(DEFAULT_USER, create=False)
+        _, default_target = _resolve_reference_path(safe_name, default_dir)
+        if default_target.is_file():
+            raise HTTPException(
+                status_code=403,
+                detail=f"Cannot delete default reference audio: {safe_name}",
+            )
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"Reference audio not found: {safe_name}")
     target.unlink()
     sidecar = meta_path_for(dir_path, target.name)
     if sidecar.exists():
@@ -1819,30 +1963,52 @@ def delete_reference_audio(filename: str, user: str = Query(default="default")):
 
 
 @app.get("/voice-presets")
-def list_voice_presets(user: str = Query(default="default")):
+def list_voice_presets(user: str = Query(default=DEFAULT_USER)):
     with voice_presets_lock:
-        presets = load_voice_presets(user_presets_path(user))
+        presets = load_effective_voice_presets(user)
         items = [presets[name] for name in sorted(presets)]
     return {"presets": items}
 
 
 @app.post("/voice-presets")
-def upsert_voice_preset(req: VoicePresetRequest, user: str = Query(default="default")):
+def upsert_voice_preset(req: VoicePresetRequest, user: str = Query(default=DEFAULT_USER)):
+    canonical_user = normalize_user(user)
     normalized = _normalize_voice_preset_payload(req.model_dump())
     with voice_presets_lock:
-        path = user_presets_path(user)
-        presets = load_voice_presets(user_presets_path(user))
+        if canonical_user != DEFAULT_USER:
+            default_presets = load_voice_presets(user_presets_path(DEFAULT_USER, create=False))
+            collision = _default_voice_collision(
+                normalized["name"],
+                default_presets=default_presets,
+                as_filename=False,
+            )
+            if collision is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot use default voice name: {collision}",
+                )
+        path = user_presets_path(canonical_user, create=True)
+        presets = load_voice_presets(path)
         presets[normalized["name"]] = normalized
         save_voice_presets(path, presets)
-    return {"ok": True, "preset": normalized}
+    return {"ok": True, "preset": {**normalized, "is_default": canonical_user == DEFAULT_USER}}
 
 
 @app.delete("/voice-presets/{name}")
-def delete_voice_preset(name: str, user: str = Query(default="default")):
+def delete_voice_preset(name: str, user: str = Query(default=DEFAULT_USER)):
+    canonical_user = normalize_user(user)
     preset_name = _normalize_preset_name(name)
     with voice_presets_lock:
-        path = user_presets_path(user)
-        presets = load_voice_presets(user_presets_path(user))
+        if canonical_user != DEFAULT_USER:
+            default_presets = load_voice_presets(user_presets_path(DEFAULT_USER, create=False))
+            collision = _find_default_preset_collision(preset_name, default_presets)
+            if collision is not None:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Cannot delete default voice preset: {collision}",
+                )
+        path = user_presets_path(canonical_user, create=False)
+        presets = load_voice_presets(path)
         if preset_name not in presets:
             raise HTTPException(status_code=404, detail=f"voice preset not found: {preset_name}")
         del presets[preset_name]
@@ -2016,9 +2182,9 @@ def _resolve_openai_tts_model_size(model: Optional[str]) -> str:
     return "fast"
 
 
-def _find_voice_preset_by_voice(voice: str, user: str) -> Optional[dict]:
+def _find_voice_preset_in_user(voice: str, user: str) -> Optional[dict]:
     with voice_presets_lock:
-        presets = load_voice_presets(user_presets_path(user))
+        presets = load_voice_presets(user_presets_path(user, create=False))
     if voice in presets:
         return presets[voice]
     lowered = voice.lower()
@@ -2028,22 +2194,44 @@ def _find_voice_preset_by_voice(voice: str, user: str) -> Optional[dict]:
     return None
 
 
-def _find_reference_audio_by_voice(voice: str, user_dir: Path) -> Optional[str]:
+def _find_voice_preset_by_voice(voice: str, user: str) -> Optional[dict]:
+    found = _find_voice_preset_in_user(voice, DEFAULT_USER)
+    if found is not None:
+        return found
+    canonical_user = normalize_user(user)
+    if canonical_user != DEFAULT_USER:
+        return _find_voice_preset_in_user(voice, canonical_user)
+    return None
+
+
+def _find_reference_audio_in_dir(voice: str, dir_path: Path) -> Optional[str]:
     if not voice or "/" in voice or "\\" in voice or voice in {".", ".."} or _is_internal_reference_file(voice):
         return None
-    exact = user_dir / voice
+    if not dir_path.is_dir():
+        return None
+    exact = dir_path / voice
     if exact.is_file() and not _is_internal_reference_file(exact.name):
         return exact.name
     lowered = voice.lower()
     ci_match: Optional[str] = None
-    for p in sorted(user_dir.iterdir()):
-        if not p.is_file() or _is_internal_reference_file(p.name):
-            continue
+    for p in _list_dir_reference_audio(dir_path):
         if p.stem == voice:
             return p.name
         if ci_match is None and (p.name.lower() == lowered or p.stem.lower() == lowered):
             ci_match = p.name
     return ci_match
+
+
+def _find_reference_audio_by_voice(voice: str, user_dir: Path) -> Optional[str]:
+    default_dir = user_audio_dir(DEFAULT_USER, create=False)
+    found = _find_reference_audio_in_dir(voice, default_dir)
+    if found is not None:
+        return found
+    if user_dir.resolve() != default_dir.resolve():
+        found = _find_reference_audio_in_dir(voice, user_dir)
+        if found is not None and _find_default_reference_collision(found) is None:
+            return found
+    return None
 
 
 def _combine_voice_description(base: str, instructions: str) -> str:
@@ -2107,23 +2295,30 @@ def _resolve_openai_voice(
         }
 
     if raw_voice:
-        preset = _find_voice_preset_by_voice(raw_voice, user)
-        if preset:
-            return {
-                "mode": "design",
-                "voice_preset": preset["name"],
-                "voice_description": _combine_voice_description(preset["voice_description"], instr),
-                "reference_audio": None,
-            }
+        default_dir = user_audio_dir(DEFAULT_USER, create=False)
+        canonical_user = normalize_user(user)
+        search_order = [(DEFAULT_USER, default_dir)]
+        if canonical_user != DEFAULT_USER:
+            search_order.append((canonical_user, user_dir))
 
-        ref_file = _find_reference_audio_by_voice(raw_voice, user_dir)
-        if ref_file:
-            return {
-                "mode": "clone",
-                "voice_preset": None,
-                "voice_description": None,
-                "reference_audio": ref_file,
-            }
+        for scope_user, scope_dir in search_order:
+            preset = _find_voice_preset_in_user(raw_voice, scope_user)
+            if preset:
+                return {
+                    "mode": "design",
+                    "voice_preset": preset["name"],
+                    "voice_description": _combine_voice_description(preset["voice_description"], instr),
+                    "reference_audio": None,
+                }
+
+            ref_file = _find_reference_audio_in_dir(raw_voice, scope_dir)
+            if ref_file and (scope_user == DEFAULT_USER or _find_default_reference_collision(ref_file) is None):
+                return {
+                    "mode": "clone",
+                    "voice_preset": None,
+                    "voice_description": None,
+                    "reference_audio": ref_file,
+                }
 
     if not raw_voice or lowered == "default" or lowered in OPENAI_VOICE_DESCRIPTIONS:
         default_voice = os.getenv("QWEN_OPENAI_DEFAULT_VOICE", "").strip()
@@ -2434,7 +2629,7 @@ def tts_audio_stream(req: TTSRequest):
     WAV header. The sample rate is in the X-Sample-Rate header either way.
     """
     req = apply_voice_preset(req)
-    user_dir = user_audio_dir(req.user or "default")
+    user_dir = user_audio_dir(req.user, create=False)
     audio_format = req.audio_format.lower().strip()
     if audio_format not in {"wav", "pcm"}:
         raise HTTPException(status_code=400, detail="audio_format must be wav or pcm for audio-stream endpoint")
@@ -2466,8 +2661,8 @@ def openai_audio_speech(req: OpenAISpeechRequest):
     if stream_format not in {"audio", "sse"}:
         raise HTTPException(status_code=400, detail="stream_format must be audio or sse")
 
-    user = req.user or "default"
-    user_dir = user_audio_dir(user)
+    user = normalize_user(req.user)
+    user_dir = user_audio_dir(user, create=False)
     resolved_voice = _resolve_openai_voice(
         voice=req.voice,
         instructions=req.instructions,
@@ -2499,7 +2694,7 @@ def openai_audio_speech(req: OpenAISpeechRequest):
 @app.post("/api/tts/stream")
 def tts_stream(req: TTSRequest):
     req = apply_voice_preset(req)
-    user_dir = user_audio_dir(req.user or "default")
+    user_dir = user_audio_dir(req.user, create=False)
     audio_format = req.audio_format.lower().strip()
     if audio_format != "wav":
         raise HTTPException(status_code=400, detail="audio_format must be wav for stream endpoint")
@@ -2611,7 +2806,7 @@ def tts_stream(req: TTSRequest):
 @app.post("/api/tts")
 def tts(req: TTSRequest):
     req = apply_voice_preset(req)
-    user_dir = user_audio_dir(req.user or "default")
+    user_dir = user_audio_dir(req.user, create=False)
     t0 = time.time()
     audio_format = req.audio_format.lower().strip()
     if audio_format not in {"wav", "ogg"}:

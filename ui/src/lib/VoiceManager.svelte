@@ -1,5 +1,15 @@
 <script lang="ts">
-  import { deletePreset, deleteVoice, fileLabel, savePreset, uploadVoice, type Preset, type Voices } from './api'
+  import {
+    defaultVoiceConflict,
+    deletePreset,
+    deleteVoice,
+    fileLabel,
+    isInheritedVoice,
+    savePreset,
+    uploadVoice,
+    type Preset,
+    type Voices,
+  } from './api'
   import Window from './Window.svelte'
 
   interface Props {
@@ -20,6 +30,13 @@
   let isNew = $state(true)
   let form = $state({ name: '', voice_description: '', description: '' })
 
+  $effect(() => {
+    void user
+    editing = false
+    confirming = ''
+    error = ''
+  })
+
   async function run(action: () => Promise<unknown>) {
     working = true
     error = ''
@@ -39,7 +56,13 @@
     const file = fileInput?.files?.[0]
     if (fileInput) fileInput.value = ''
     if (!file) return
-    if (voices.files.some((voice) => voice.filename === file.name) && !confirm(`Replace ${file.name}?`)) return
+    const conflict = defaultVoiceConflict(user, file.name, voices, true)
+    if (conflict) {
+      error = `${file.name} conflicts with default voice ${conflict}`
+      return
+    }
+    const existing = voices.files.some((item) => !isInheritedVoice(user, item) && item.filename === file.name)
+    if (existing && !confirm(`Replace ${file.name}?`)) return
     await run(() => uploadVoice(user, file))
   }
 
@@ -63,6 +86,11 @@
   async function submit(event: SubmitEvent) {
     event.preventDefault()
     const name = form.name.trim()
+    const conflict = defaultVoiceConflict(user, name, voices, false)
+    if (conflict) {
+      error = `${name} conflicts with default voice ${conflict}`
+      return
+    }
     if (isNew && voices.presets.some((preset) => preset.name === name)) {
       error = `${name} already exists`
       return
@@ -100,12 +128,17 @@
     <ul class="voices">
       {#each voices.files as file (file.filename)}
         {@const value = `clone:${file.filename}`}
+        {@const shared = isInheritedVoice(user, file)}
         <li class:selected={voice === value}>
           <button type="button" class="pick" aria-pressed={voice === value} onclick={() => (voice = value)}>
             <span>{fileLabel(file.filename, voices.files)}</span>
             {#if file.description}<span class="dim desc">{file.description}</span>{/if}
           </button>
-          {@render deleteButton(value, file.filename, () => deleteVoice(user, file.filename))}
+          {#if shared}
+            <span class="dim tag">default</span>
+          {:else}
+            {@render deleteButton(value, file.filename, () => deleteVoice(user, file.filename))}
+          {/if}
         </li>
       {/each}
     </ul>
@@ -137,13 +170,18 @@
     <ul class="voices">
       {#each voices.presets as preset (preset.name)}
         {@const value = `preset:${preset.name}`}
+        {@const shared = isInheritedVoice(user, preset)}
         <li class:selected={voice === value}>
           <button type="button" class="pick" aria-pressed={voice === value} onclick={() => (voice = value)}>
             <span>{preset.name}</span>
             <span class="dim desc">{preset.description || preset.voice_description}</span>
           </button>
-          <button type="button" class="small" aria-label={`Edit ${preset.name}`} onclick={() => edit(preset)}>Edit</button>
-          {@render deleteButton(value, preset.name, () => deletePreset(user, preset.name))}
+          {#if shared}
+            <span class="dim tag">default</span>
+          {:else}
+            <button type="button" class="small" aria-label={`Edit ${preset.name}`} onclick={() => edit(preset)}>Edit</button>
+            {@render deleteButton(value, preset.name, () => deletePreset(user, preset.name))}
+          {/if}
         </li>
       {/each}
     </ul>

@@ -220,8 +220,7 @@
           <ClipRow
             {clip}
             {user}
-            takenFiles={voices.files.map((file) => file.filename)}
-            takenPresets={voices.presets.map((preset) => preset.name)}
+            {voices}
             onremove={() => remove(clip)}
             {onsaved}
           />

@@ -6,12 +6,14 @@ export interface ReferenceFile {
   filename: string
   source: string
   description: string | null
+  is_default?: boolean
 }
 
 export interface Preset {
   name: string
   voice_description: string
   description?: string | null
+  is_default?: boolean
 }
 
 export interface Voices {
@@ -69,6 +71,35 @@ const stem = (filename: string) => filename.replace(/\.\w+$/, '')
 export function fileLabel(filename: string, files: ReferenceFile[]): string {
   const clash = files.some((file) => file.filename !== filename && stem(file.filename) === stem(filename))
   return clash ? filename : stem(filename)
+}
+
+export function isInheritedVoice(user: string, voice: { is_default?: boolean }): boolean {
+  return user !== 'default' && Boolean(voice.is_default)
+}
+
+export function defaultVoiceConflict(user: string, name: string, voices: Voices, asFilename = false): string | null {
+  if (user === 'default') return null
+  const trimmed = name.trim()
+  if (!trimmed) return null
+  const target = trimmed.toLowerCase()
+  const targetStem = (asFilename ? stem(trimmed) : trimmed).toLowerCase()
+
+  for (const file of voices.files) {
+    if (!file.is_default) continue
+    const fileLower = file.filename.toLowerCase()
+    const fileStem = stem(file.filename).toLowerCase()
+    if (fileLower === target || fileStem === target || fileStem === targetStem) {
+      return file.filename
+    }
+  }
+  for (const preset of voices.presets) {
+    if (!preset.is_default) continue
+    const presetLower = preset.name.toLowerCase()
+    if (presetLower === target || presetLower === targetStem) {
+      return preset.name
+    }
+  }
+  return null
 }
 
 const forUser = (user: string) => `?user=${encodeURIComponent(user)}`
